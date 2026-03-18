@@ -1,4 +1,11 @@
-import type { FunctionInfo, HeaderWsEvent, Settings, TextWsEvent, WsEvent } from './types'
+import type {
+  FunctionInfo,
+  HeaderWsEvent,
+  Settings,
+  TextTranslateDirection,
+  TextWsEvent,
+  WsEvent,
+} from './types'
 
 let _port = 8765
 
@@ -99,7 +106,7 @@ export function startTranslation(
 
 // ── WebSocket: text translation stream ───────────────────────────────────────
 
-export function startTextTranslation(
+function startEnglishToChineseTextTranslation(
   settings: Settings,
   text: string,
   onEvent: (e: TextWsEvent) => void,
@@ -122,6 +129,45 @@ export function startTextTranslation(
   ws.onerror = () => onEvent({ type: 'error', message: 'WebSocket 连接失败' })
 
   return { stop: () => { if (ws.readyState === WebSocket.OPEN) ws.close() } }
+}
+
+export function startTextTranslation(
+  settings: Settings,
+  text: string,
+  direction: TextTranslateDirection,
+  onEvent: (e: TextWsEvent) => void,
+): { stop: () => void } {
+  if (direction === 'en_to_zh') {
+    return startEnglishToChineseTextTranslation(settings, text, onEvent)
+  }
+
+  const w = window as any
+  if (!w.electronAPI?.translateText) {
+    queueMicrotask(() => {
+      onEvent({ type: 'error', message: '当前环境暂不支持中文转英文，请在 Electron 应用中使用。' })
+    })
+    return { stop: () => {} }
+  }
+
+  let stopped = false
+
+  void w.electronAPI.translateText({
+    host: settings.host,
+    model: settings.model,
+    text,
+    sourceLanguage: 'Chinese',
+    targetLanguage: 'English',
+  }).then((translated: string) => {
+    if (stopped) return
+    onEvent({ type: 'chunk', idx: 0, total: 1, partial: translated })
+    onEvent({ type: 'done', text: translated })
+  }).catch((err: unknown) => {
+    if (stopped) return
+    const message = err instanceof Error ? err.message : String(err)
+    onEvent({ type: 'error', message })
+  })
+
+  return { stop: () => { stopped = true } }
 }
 
 // ── WebSocket: header comment generation stream ───────────────────────────────

@@ -1,10 +1,11 @@
 import { useCallback, useRef, useState } from 'react'
 import type { FunctionInfo, HeaderWsEvent, Settings } from '../types'
-import { apiAnalyzeHeader, apiApplyComments, startHeaderGeneration } from '../api'
+import { apiAnalyzeHeader, apiApplyComments, apiScan, startHeaderGeneration } from '../api'
 
 interface Props { settings: Settings }
 
 export default function HeaderPage({ settings }: Props) {
+  const HEADER_EXT_RE = /\.(h|hpp|hxx|hh)$/i
   const [filePath,       setFilePath]       = useState<string | null>(null)
   const [functions,      setFunctions]      = useState<FunctionInfo[]>([])
   const [isAnalyzing,    setIsAnalyzing]    = useState(false)
@@ -40,13 +41,37 @@ export default function HeaderPage({ settings }: Props) {
   }, [])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    dragCounter.current = 0
-    setDragging(false)
-    const file = Array.from(e.dataTransfer.files).find(f =>
-      /\.(h|hpp|hxx|hh)$/i.test(f.name)
-    )
-    if (file) loadFile((file as any).path ?? '')
+    void (async () => {
+      e.preventDefault()
+      dragCounter.current = 0
+      setDragging(false)
+
+      const droppedPaths = Array.from(e.dataTransfer.files)
+        .map(f => (f as any).path ?? '')
+        .filter(Boolean)
+
+      if (droppedPaths.length === 0) return
+
+      const directHeader = droppedPaths.find(path => HEADER_EXT_RE.test(path))
+      if (directHeader) {
+        await loadFile(directHeader)
+        return
+      }
+
+      setIsAnalyzing(true)
+      setStatusMsg('扫描头文件…')
+      try {
+        const { files } = await apiScan(droppedPaths)
+        const headerPath = files.find(path => HEADER_EXT_RE.test(path))
+        if (headerPath) {
+          await loadFile(headerPath)
+          return
+        }
+        setStatusMsg('未找到 .h / .hpp 头文件')
+      } finally {
+        setIsAnalyzing(false)
+      }
+    })()
   }, [loadFile])
 
   const handleBrowse = async () => {

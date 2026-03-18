@@ -29,6 +29,7 @@
     "productName": "translate-comments",
     "files": ["dist/**", "electron/**"],
     "extraResources": [
+      { "from": "python_shims", "to": "python_shims" },
       { "from": "../", "to": "backend",
         "filter": ["translate_comments/**", "!**/__pycache__/**"] }
     ],

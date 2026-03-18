@@ -1,14 +1,27 @@
 """Parse C++ header files to extract function declarations.
 
-Finds every function/method declaration, determines whether it already has
-a preceding Doxygen/line comment, and returns structured metadata so the
-AI comment generator can produce well-targeted output.
+Strategy
+--------
+1. Preprocess the source: replace string/char literals and comment
+   *bodies* with spaces so the line structure is preserved (line numbers
+   stay accurate) but syntactic noise is eliminated.
+2. Walk the preprocessed lines while keeping accurate brace-depth and
+   class-scope state.  Brace counts happen **unconditionally** before any
+   skip logic so depth is never lost.
+3. Only examine lines at "declaration depth" (not inside a function body).
+4. Match function names with a lenient regex that handles:
+     - Regular functions:   ``void foo(int x);``
+     - Constructors:        ``MyClass();``  (no return type)
+     - Destructors:         ``~MyClass();``
+     - Qualified names:     ``Ns::Class::method()``
+     - Templates (next-line body): ``T getValue() const;``
+5. Filter matched names against a keyword blocklist.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -16,18 +29,18 @@ from dataclasses import dataclass, field
 @dataclass
 class FunctionInfo:
     """A single function/method declaration found in a header file."""
-    name: str                   # simple identifier (e.g. "parse", "~MyClass")
+    name: str                   # simple identifier (e.g. ``parse``, ``~MyClass``)
     full_signature: str         # complete declaration text (may span lines)
     line_start: int             # 1-based, first line of declaration
     line_end: int               # 1-based, last line of declaration
-    class_context: str          # enclosing class/struct name, "" for free functions
+    class_context: str          # enclosing class/struct name; "" for free functions
     has_comment: bool           # True if a comment block immediately precedes this
     existing_comment: str       # text of that comment, or ""
     comment_line_start: int     # 1-based; -1 if no comment
     comment_line_end: int       # 1-based; -1 if no comment
 
 
-# ── Control-flow keywords (never function names) ──────────────────────────────
+# ── Keywords that are definitely not function names ───────────────────────────
 
 _CTRL_FLOW = frozenset({
     "if", "else", "while", "for", "do", "switch", "case", "default",
@@ -35,16 +48,24 @@ _CTRL_FLOW = frozenset({
     "sizeof", "alignof", "decltype", "typeid", "new", "delete",
     "static_assert", "assert", "class", "struct", "enum", "union",
     "namespace", "typedef", "using", "template", "friend", "extern",
-    "operator",
+    "operator", "auto",
+})
+
+# First word on a line that means "skip this line for function detection"
+# (braces are still counted before the skip)
+_SKIP_FIRST_WORD = frozenset({
+    "class", "struct", "enum", "union", "namespace", "typedef", "using",
+    "template", "friend", "return", "if", "else", "while", "for", "switch",
+    "case", "break", "continue", "goto", "throw", "catch", "#",
+    "public", "private", "protected", "signals", "slots",
 })
 
 
 # ── Source preprocessor ───────────────────────────────────────────────────────
 
 def _preprocess(source: str) -> list[str]:
-    """Return lines where string/char literals and comment *bodies* are replaced
-    with spaces, so the line structure is preserved for accurate line numbers.
-    Block-comment delimiters `/*` and `*/` become two spaces each.
+    """Return lines where string/char literal content and comment bodies
+    are replaced with spaces, so line structure is preserved exactly.
     """
     out: list[str] = []
     line: list[str] = []
@@ -86,7 +107,7 @@ def _preprocess(source: str) -> list[str]:
                 i += 1
             continue
 
-        # Line comment → blank out to EOL
+        # Line comment
         if c == "/" and i + 1 < n and source[i + 1] == "/":
             while i < n and source[i] != "\n":
                 line.append(" ")
@@ -107,7 +128,7 @@ def _preprocess(source: str) -> list[str]:
             in_string = True
             continue
 
-        # Char literal (skip until matching ' or newline)
+        # Char literal
         if c == "'":
             line.append(c)
             i += 1
@@ -134,34 +155,27 @@ def _preprocess(source: str) -> list[str]:
 # ── Comment-before detector ───────────────────────────────────────────────────
 
 def _find_comment_before(orig_lines: list[str], line_idx: int) -> tuple[int, int, str]:
-    """Look backwards from line_idx (0-based) for a comment block that
+    """Look backwards from *line_idx* (0-based) for a comment block that
     immediately precedes this line (one blank line is tolerated).
 
     Returns ``(start_0based, end_0based, text)`` or ``(-1, -1, "")``.
     """
     i = line_idx - 1
-
-    # Allow one blank separator
     if i >= 0 and not orig_lines[i].strip():
         i -= 1
-
     if i < 0:
         return -1, -1, ""
 
     s = orig_lines[i].strip()
 
-    # Line-comment block (//...)
     if s.startswith("//"):
-        end = i
-        start = i
+        end = start = i
         while start > 0 and orig_lines[start - 1].strip().startswith("//"):
             start -= 1
         return start, end, "\n".join(orig_lines[start : end + 1])
 
-    # End of / inside a block comment
     if s.endswith("*/") or s.startswith("/*") or (s.startswith("*") and not s.startswith("*/")):
         end = i
-        # Walk forward to find actual */ if we landed mid-block
         while end < line_idx - 1 and not orig_lines[end].strip().endswith("*/"):
             end += 1
         start = i
@@ -172,24 +186,33 @@ def _find_comment_before(orig_lines: list[str], line_idx: int) -> tuple[int, int
     return -1, -1, ""
 
 
-# ── Function-declaration pattern ──────────────────────────────────────────────
+# ── Function-declaration regex ────────────────────────────────────────────────
+#
+# Key design choices:
+#   * Return type is OPTIONAL (``?``) so constructors / destructors match.
+#   * Qualifiers (virtual, static, …) are matched before the optional return type.
+#   * ``~?`` at the start of name handles destructors.
+#   * ``[^)]*`` inside the parameter group is deliberately loose to
+#     tolerate ``std::function<void(int)>`` style parameters; false positives
+#     are rejected via the ``_CTRL_FLOW`` blocklist.
+#   * Terminator: ``;``, ``{`` (inline def), or ``= 0 ;`` / ``= default ;`` /
+#     ``= delete ;`` (special member declarations).
 
-_FUNC_RE = re.compile(
-    r"(?:(?:virtual|static|inline|explicit|constexpr|const|volatile|"
-    r"mutable|friend|override|final|noexcept|nodiscard|\[\[[\w:,\s]+\]\])\s+)*"
-    r"(?:[\w:*&<>\s,]+?\s+)"   # return type (non-greedy)
-    r"(?P<name>~?[A-Za-z_]\w*)\s*"  # function name
-    r"\([^)]*\)"                # parameter list
-    r"[^;{=]*"                  # post-qualifiers (const, override, noexcept …)
-    r"(?:;|\{|=\s*(?:0|default|delete)\s*;)",  # terminator
+_QUALIFIERS = (
+    r"(?:(?:virtual|static|inline|explicit|constexpr|const|volatile|mutable|"
+    r"friend|override|final|noexcept|nodiscard|\[\[[\w:,\s]+\]\]|__\w+)\s+)*"
 )
 
-# Prefixes that are definitively NOT function declarations on the same line
-_SKIP_FIRST_WORD = frozenset({
-    "class", "struct", "enum", "union", "namespace", "typedef", "using",
-    "template", "friend", "return", "if", "else", "while", "for", "switch",
-    "case", "break", "continue", "goto", "throw", "catch", "#",
-})
+_FUNC_RE = re.compile(
+    _QUALIFIERS
+    + r"(?:[\w:*&<>\s,\[\]]+?\s+)?"   # optional return type  (none for ctors/dtors)
+    + r"(?P<name>~?[A-Za-z_]\w*)\s*"  # function name
+    + r"\("                            # opening paren
+    + r"[^)]*"                         # params (simplified)
+    + r"\)"
+    + r"[^;{=]*"                       # post-qualifiers (const, override …)
+    + r"(?:;|\{|=\s*(?:0|default|delete)\s*;)",  # terminator
+)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -199,13 +222,20 @@ def parse_header(source: str) -> list[FunctionInfo]:
 
     Works on both header files (.h/.hpp) and implementation files (.cpp).
     Returns a deduplicated list of :class:`FunctionInfo` sorted by line number.
+
+    Handles:
+    * ``class Foo {`` and ``class Foo\\n{`` (brace on next line)
+    * Constructors, destructors, and plain methods
+    * Multi-line declarations (accumulated until parens balance)
+    * Only looks for declarations at declaration depth (skips function bodies)
     """
     orig_lines = source.splitlines()
     proc_lines = _preprocess(source)
 
     results: list[FunctionInfo] = []
     class_stack: list[str] = []
-    brace_depth = 0
+    brace_depth = 0          # total open braces
+    pending_class: str | None = None   # class whose { hasn't appeared yet
     seen_lines: set[int] = set()
 
     i = 0
@@ -213,21 +243,41 @@ def parse_header(source: str) -> list[FunctionInfo]:
         raw = proc_lines[i]
         stripped = raw.strip()
 
-        # ── Track class/struct scope ──────────────────────────────────────
-        cls_m = re.match(r"\s*(?:class|struct)\s+(\w+)[^;]*$", raw)
-        if cls_m and "{" in raw:
-            class_stack.append(cls_m.group(1))
-            brace_depth += raw.count("{")
+        # ── STEP 1: unconditionally track braces ──────────────────────────
+        #   This must happen before any ``continue`` so we never lose depth.
+
+        opens  = raw.count("{")
+        closes = raw.count("}")
+
+        # If there's a pending class name (class Foo on its own line),
+        # the first { on the NEXT non-empty line belongs to that class.
+        if opens > 0 and pending_class is not None:
+            class_stack.append(pending_class)
+            pending_class = None
+
+        brace_depth += opens - closes
+
+        # Pop class_stack when a closing brace reaches the right depth
+        # (each entry was pushed when brace_depth was already incremented)
+        # We track "class was opened at depth N" implicitly via stack length:
+        # when brace_depth drops below len(class_stack), the top class closed.
+        while class_stack and brace_depth < len(class_stack):
+            class_stack.pop()
+
+        # ── STEP 2: detect class/struct declarations ──────────────────────
+        cls_m = re.match(r"\s*(?:class|struct)\s+(\w+)[^;{]*(?:\{|$)", raw)
+        if cls_m:
+            cls_name = cls_m.group(1)
+            if "{" in raw:
+                # class opens on this line — already counted in opens above
+                class_stack.append(cls_name)
+            else:
+                # class is declared alone; { will appear on a later line
+                pending_class = cls_name
             i += 1
             continue
 
-        opens = raw.count("{")
-        closes = raw.count("}")
-        brace_depth += opens - closes
-        if closes and class_stack and brace_depth < len(class_stack):
-            class_stack.pop()
-
-        # ── Skip trivially non-function lines ────────────────────────────
+        # ── STEP 3: skip trivially non-function lines ─────────────────────
         if not stripped or stripped.startswith("#"):
             i += 1
             continue
@@ -238,27 +288,35 @@ def parse_header(source: str) -> list[FunctionInfo]:
             i += 1
             continue
 
+        # ── STEP 4: skip if inside a function/method body ─────────────────
+        #   class_stack has one entry per open class brace.
+        #   brace_depth == len(class_stack) means we're directly at class body.
+        #   brace_depth > len(class_stack) means we're inside a nested { }.
+        if brace_depth > len(class_stack):
+            i += 1
+            continue
+
         if "(" not in raw:
             i += 1
             continue
 
-        # ── Accumulate multi-line declarations ───────────────────────────
+        # ── STEP 5: accumulate multi-line declarations ────────────────────
         decl_start = i
-        combined = proc_lines[i]
-        depth = raw.count("(") - raw.count(")")
+        combined   = proc_lines[i]
+        paren_depth = raw.count("(") - raw.count(")")
         j = i + 1
-        while depth > 0 and j < len(proc_lines) and j < i + 20:
+        while paren_depth > 0 and j < len(proc_lines) and j < i + 20:
             nxt = proc_lines[j]
-            combined += " " + nxt.strip()
-            depth += nxt.count("(") - nxt.count(")")
+            combined   += " " + nxt.strip()
+            paren_depth += nxt.count("(") - nxt.count(")")
             j += 1
-        decl_end = (j - 1) if (j > i + 1 and depth <= 0) else i
+        decl_end = (j - 1) if (j > i + 1 and paren_depth <= 0) else i
 
-        # ── Try to match a function declaration ──────────────────────────
+        # ── STEP 6: regex match ───────────────────────────────────────────
         m = _FUNC_RE.search(combined)
         if m:
             func_name = m.group("name")
-            if func_name not in _CTRL_FLOW and len(func_name) > 1 and decl_start not in seen_lines:
+            if func_name not in _CTRL_FLOW and decl_start not in seen_lines:
                 seen_lines.add(decl_start)
                 sig = "\n".join(orig_lines[decl_start : decl_end + 1]).strip()
                 cs, ce, ct = _find_comment_before(orig_lines, decl_start)

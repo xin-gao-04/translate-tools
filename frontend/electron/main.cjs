@@ -29,6 +29,9 @@ function startBackend () {
   if (!pythonCmd) return   // production bundling handled separately
 
   const exe = process.platform === 'win32' ? 'python' : 'python3'
+  const shimPath = isDev
+    ? path.join(__dirname, '..', 'python_shims')
+    : path.join(process.resourcesPath, 'python_shims')
 
   // In dev, run from the project root (one level up from frontend/)
   const cwd = isDev
@@ -37,7 +40,11 @@ function startBackend () {
 
   backendProcess = spawn(exe, pythonCmd, {
     cwd,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      PYTHONPATH: [shimPath, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    },
   })
 
   backendProcess.stdout.on('data', d => process.stdout.write(`[backend] ${d}`))
@@ -119,6 +126,55 @@ ipcMain.handle('dialog:openFile', async () => {
 })
 
 ipcMain.handle('app:getApiPort', () => API_PORT)
+
+ipcMain.handle('ollama:translateText', async (_event, payload) => {
+  const text = String(payload?.text ?? '').trim()
+  const host = String(payload?.host ?? 'http://localhost:11434').replace(/\/$/, '')
+  const model = String(payload?.model ?? 'qwen2.5:7b')
+  const sourceLanguage = String(payload?.sourceLanguage ?? 'Chinese')
+  const targetLanguage = String(payload?.targetLanguage ?? 'English')
+
+  if (!text) {
+    throw new Error('文本不能为空')
+  }
+
+  const response = await fetch(`${host}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      messages: [
+        {
+          role: 'system',
+          content:
+            `You are a precise technical translator. Translate the following text from ${sourceLanguage} to ${targetLanguage}. `
+            + 'Output only the translated text. Preserve code identifiers, API names, file paths, and technical terms when appropriate.',
+        },
+        {
+          role: 'user',
+          content: `Text to translate:\n${text}`,
+        },
+      ],
+      options: {
+        temperature: 0.1,
+        num_predict: 768,
+      },
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Ollama 请求失败: HTTP ${response.status}`)
+  }
+
+  const data = await response.json()
+  const translated = data?.message?.content
+  if (typeof translated !== 'string' || !translated.trim()) {
+    throw new Error('Ollama 返回了空结果')
+  }
+
+  return translated.trim()
+})
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 

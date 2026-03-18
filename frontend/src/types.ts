@@ -37,6 +37,8 @@ export type TextWsEvent =
   | { type: 'done';  text: string }
   | { type: 'error'; message: string }
 
+export type TextTranslateDirection = 'en_to_zh' | 'zh_to_en'
+
 export type HeaderWsEvent =
   | { type: 'function_started'; name: string; line: number }
   | { type: 'comment_chunk';    name: string; partial: string }

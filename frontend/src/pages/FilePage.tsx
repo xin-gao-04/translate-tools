@@ -10,6 +10,7 @@ import BottomBar from '../components/BottomBar'
 interface State {
   files: FileEntry[]
   comments: Record<string, CommentRow[]>
+  commentsLoaded: Record<string, boolean>
   translations: Record<string, Record<string, string>>
   isRunning: boolean
   doneFiles: number
@@ -44,10 +45,14 @@ function reducer(state: State, action: Action): State {
       return { ...state, files: [...state.files, ...newFiles] }
     }
     case 'CLEAR_FILES':
-      return { ...state, files: [], comments: {}, translations: {} }
+      return { ...state, files: [], comments: {}, commentsLoaded: {}, translations: {} }
 
     case 'LOAD_COMMENTS':
-      return { ...state, comments: { ...state.comments, [action.path]: action.rows } }
+      return {
+        ...state,
+        comments: { ...state.comments, [action.path]: action.rows },
+        commentsLoaded: { ...state.commentsLoaded, [action.path]: true },
+      }
 
     case 'FILE_STARTED':
       return { ...state, files: state.files.map(f => f.path === action.path ? { ...f, status: 'running' } : f) }
@@ -120,7 +125,7 @@ function reducer(state: State, action: Action): State {
 }
 
 const INIT: State = {
-  files: [], comments: {}, translations: {},
+  files: [], comments: {}, commentsLoaded: {}, translations: {},
   isRunning: false, doneFiles: 0, totalTranslated: 0,
   statusMsg: '就绪 — 拖放文件夹或点击「添加」开始',
 }
@@ -181,7 +186,7 @@ export default function FilePage({ settings }: Props) {
 
   const handleSelectFile = useCallback(async (path: string) => {
     setSelectedFile(path)
-    if (!state.comments[path]) {
+    if (!state.commentsLoaded[path]) {
       const data = await apiComments([path])
       const rawRows = data[path] ?? []
       const rows: CommentRow[] = rawRows.map((r: any) => {
@@ -201,7 +206,7 @@ export default function FilePage({ settings }: Props) {
       })
       dispatch({ type: 'LOAD_COMMENTS', path, rows })
     }
-  }, [state.comments, state.translations])
+  }, [state.commentsLoaded, state.translations])
 
   const handleStart = useCallback(() => {
     if (state.isRunning || state.files.length === 0) return
