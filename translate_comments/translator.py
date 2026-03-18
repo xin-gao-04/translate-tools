@@ -35,7 +35,12 @@ _SYSTEM_PROMPT = (
     "  4. Do NOT add punctuation that was not in the original unless grammatically required.\n"
 )
 
-_USER_TEMPLATE = "Comment to translate:\n{text}"
+_USER_TEMPLATE = (
+    "Comment to translate:\n{text}\n\n"
+    "Use the surrounding source context only to disambiguate meaning. "
+    "Translate only the comment text itself.\n"
+    "{context_block}"
+)
 
 
 class TranslationError(RuntimeError):
@@ -78,12 +83,25 @@ class OllamaTranslator:
     # Public interface                                                     #
     # ------------------------------------------------------------------ #
 
-    def translate(self, text: str) -> str:
+    def translate(
+        self,
+        text: str,
+        *,
+        context_before: str = "",
+        context_after: str = "",
+        related_text: str = "",
+    ) -> str:
         """Translate a single *text* string and return the Chinese result.
 
         Raises ``TranslationError`` on failure.
         """
-        payload = self._build_payload(text, stream=False)
+        payload = self._build_payload(
+            text,
+            stream=False,
+            context_before=context_before,
+            context_after=context_after,
+            related_text=related_text,
+        )
         response = self._post_with_retry("/api/chat", payload)
         return self._parse_chat_response(response)
 
@@ -202,13 +220,37 @@ class OllamaTranslator:
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    def _build_payload(self, text: str, stream: bool = False) -> dict:
+    def _build_payload(
+        self,
+        text: str,
+        stream: bool = False,
+        *,
+        context_before: str = "",
+        context_after: str = "",
+        related_text: str = "",
+    ) -> dict:
+        context_parts: list[str] = []
+        if context_before.strip():
+            context_parts.append(f"Source context before:\n{context_before.strip()}")
+        if context_after.strip():
+            context_parts.append(f"Source context after:\n{context_after.strip()}")
+        if related_text.strip():
+            context_parts.append(f"Full comment block context:\n{related_text.strip()}")
+        context_block = "\n\n".join(context_parts).strip()
+        if not context_block:
+            context_block = "(no extra context)"
         return {
             "model": self.model,
             "stream": stream,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": _USER_TEMPLATE.format(text=text)},
+                {
+                    "role": "user",
+                    "content": _USER_TEMPLATE.format(
+                        text=text,
+                        context_block=context_block,
+                    ),
+                },
             ],
             "options": {
                 "temperature": 0.1,   # low temperature → deterministic translation
@@ -224,12 +266,20 @@ class OllamaTranslator:
                 resp = self._session.post(url, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 return resp
-            except requests.ConnectionError as exc:
+            except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
             except requests.HTTPError as exc:
+                last_exc = exc
+                status = exc.response.status_code if exc.response is not None else None
+                if status is not None and status >= 500 and attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                    continue
                 raise TranslationError(f"Ollama HTTP error: {exc}") from exc
+            except requests.RequestException as exc:
+                last_exc = exc
+                raise TranslationError(f"Ollama request failed: {exc}") from exc
         raise TranslationError(
             f"Cannot reach Ollama at {self.host} after {self.max_retries} attempts: {last_exc}"
         )

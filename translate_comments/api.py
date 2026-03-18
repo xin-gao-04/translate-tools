@@ -14,7 +14,8 @@ POST /api/scan                   → list of matching source files
 GET  /api/check?host=…&model=…   → Ollama connection status
 POST /api/comments               → parse + return comments with context lines
 POST /api/apply                  → write cached translations to disk
-POST /api/analyze-header         → parse C++ header, return function list
+POST /api/analyze-header         → parse C++ header, return symbol list
+POST /api/preview-comments       → preview generated header comments as diff
 POST /api/apply-comments         → write generated comments into header file
 WS   /ws                         → stream translation events (file mode)
 WS   /ws/translate-text          → stream translation of arbitrary text
@@ -34,9 +35,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from translate_comments import __version__
-from translate_comments.comment_generator import generate_doxygen
+from translate_comments.comment_generator import (
+    HeaderCommentOptions,
+    HeaderTag,
+    generate_symbol_comment,
+)
 from translate_comments.detector import is_english
-from translate_comments.header_parser import parse_header
+from translate_comments.header_workflow import (
+    analyze_header_file,
+    apply_header_comments,
+    preview_header_comments,
+)
 from translate_comments.parsers import get_parser
 from translate_comments.scanner import FileScanner
 from translate_comments.splitter import split_for_translation
@@ -82,17 +91,34 @@ class AnalyzeHeaderRequest(BaseModel):
     path: str
 
 
+class HeaderTagRequest(BaseModel):
+    name: str
+    value: str = ""
+
+
 class GenerateCommentsRequest(BaseModel):
     path: str
-    function_lines: list[int]   # line_start values of functions to generate for
+    symbol_lines: list[int]
     replace_existing: bool = False
     host: str = "http://localhost:11434"
     model: str = "qwen2.5:7b"
+    include_brief: bool = True
+    include_params: bool = True
+    include_return: bool = True
+    author: str = ""
+    include_date: bool = False
+    date_format: str = "%Y-%m-%d"
+    custom_tags: list[HeaderTagRequest] = []
 
 
 class ApplyCommentsRequest(BaseModel):
     path: str
-    # line_start → comment text to insert above that line
+    comments: dict[str, str]
+    replace_existing: bool = False
+
+
+class PreviewCommentsRequest(BaseModel):
+    path: str
     comments: dict[str, str]
     replace_existing: bool = False
 
@@ -169,74 +195,71 @@ async def get_comments(req: ScanRequest) -> dict:
 
 @app.post("/api/analyze-header")
 async def analyze_header(req: AnalyzeHeaderRequest) -> dict:
-    """Parse a C++ header file and return function declaration metadata."""
+    """Parse a C++ header file and return symbol metadata."""
+    path = Path(req.path)
+    try:
+        symbols = analyze_header_file(path)
+    except OSError as exc:
+        return {"error": str(exc), "symbols": [], "functions": []}
+
+    payload = [
+        {
+            "kind":               symbol.kind,
+            "name":               symbol.name,
+            "full_signature":     symbol.full_signature,
+            "line_start":         symbol.line_start,
+            "line_end":           symbol.line_end,
+            "class_context":      symbol.class_context,
+            "namespace_context":  symbol.namespace_context,
+            "has_comment":        symbol.has_comment,
+            "existing_comment":   symbol.existing_comment,
+            "comment_line_start": symbol.comment_line_start,
+            "comment_line_end":   symbol.comment_line_end,
+            "implementation_path": symbol.implementation_path,
+            "implementation_snippet": symbol.implementation_snippet,
+        }
+        for symbol in symbols
+    ]
+    return {
+        "symbols": payload,
+        "functions": [item for item in payload if item["kind"] == "function"],
+    }
+
+
+@app.post("/api/preview-comments")
+async def preview_comments(req: PreviewCommentsRequest) -> dict:
+    """Preview generated header comments without writing to disk."""
     path = Path(req.path)
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
+        symbols = analyze_header_file(path)
     except OSError as exc:
-        return {"error": str(exc), "functions": []}
-    funcs = parse_header(source)
-    return {
-        "functions": [
-            {
-                "name":               f.name,
-                "full_signature":     f.full_signature,
-                "line_start":         f.line_start,
-                "line_end":           f.line_end,
-                "class_context":      f.class_context,
-                "has_comment":        f.has_comment,
-                "existing_comment":   f.existing_comment,
-                "comment_line_start": f.comment_line_start,
-                "comment_line_end":   f.comment_line_end,
-            }
-            for f in funcs
-        ]
-    }
+        return {"ok": False, "error": str(exc), "diff": "", "preview": ""}
+
+    comments = {int(line): text for line, text in req.comments.items()}
+    preview, diff = preview_header_comments(
+        path,
+        source,
+        symbols,
+        comments,
+        req.replace_existing,
+    )
+    return {"ok": True, "diff": diff, "preview": preview}
 
 
 @app.post("/api/apply-comments")
 async def apply_comments(req: ApplyCommentsRequest) -> dict:
-    """Insert/replace Doxygen comments above function declarations in a header file."""
+    """Insert or replace generated comments above header symbols."""
     path = Path(req.path)
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
+        symbols = analyze_header_file(path)
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
-    lines = source.splitlines(keepends=True)
-
-    # Build a map: line_start (1-based) → (comment_text, replace_existing, comment_line_start, comment_line_end)
-    # We parse the header to get existing comment positions.
-    funcs = parse_header(source)
-    func_map = {f.line_start: f for f in funcs}
-
-    # Apply in reverse order so line numbers stay valid
-    for line_str, comment_text in sorted(req.comments.items(), key=lambda x: -int(x[0])):
-        target_line = int(line_str)
-        func = func_map.get(target_line)
-
-        # Determine indentation from the function declaration line
-        decl_line = lines[target_line - 1] if target_line <= len(lines) else ""
-        indent = len(decl_line) - len(decl_line.lstrip())
-        prefix = " " * indent
-
-        # Add indentation to each comment line
-        indented_comment = "\n".join(
-            prefix + l if l.strip() else l
-            for l in comment_text.splitlines()
-        ) + "\n"
-
-        if func and func.has_comment and req.replace_existing:
-            # Replace existing comment
-            cs = func.comment_line_start - 1  # 0-based
-            ce = func.comment_line_end        # exclusive
-            lines[cs:ce] = [indented_comment]
-        else:
-            # Insert before the function declaration
-            insert_at = target_line - 1  # 0-based
-            lines.insert(insert_at, indented_comment)
-
-    path.write_text("".join(lines), encoding="utf-8")
+    comments = {int(line): text for line, text in req.comments.items()}
+    new_source = apply_header_comments(source, symbols, comments, req.replace_existing)
+    path.write_text(new_source, encoding="utf-8")
     return {"ok": True}
 
 
@@ -311,6 +334,8 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 total_errors += 1
                 continue
 
+            source_lines = source.splitlines()
+
             parser = get_parser(path.suffix)
             if not parser:
                 await ws.send_json({
@@ -334,19 +359,29 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
             if not english:
                 await ws.send_json({
                     "type": "file_done", "path": path_str,
-                    "translated": 0, "skipped": skipped,
+                    "translated": 0, "skipped": skipped, "untranslated": 0,
+                    "translations": {},
                 })
                 continue
 
             translations: dict[int, str] = {}
             file_translated = 0
+            file_untranslated = 0
+
+            def _context_for(comment) -> tuple[str, str]:
+                before_start = max(0, comment.line_start - 4)
+                before_end = max(0, comment.line_start - 1)
+                after_start = min(len(source_lines), comment.line_end)
+                after_end = min(len(source_lines), comment.line_end + 3)
+                before = "\n".join(source_lines[before_start:before_end])
+                after = "\n".join(source_lines[after_start:after_end])
+                return before, after
 
             for c in english:
-                chunks = (
-                    split_for_translation(c.text)
-                    if len(c.text) > req.chunk_threshold
-                    else []
-                )
+                context_before, context_after = _context_for(c)
+                chunks = split_for_translation(c.text, max_chars=req.chunk_threshold)
+                if len(chunks) <= 1:
+                    chunks = []
                 chunk_total = max(len(chunks), 1)
 
                 await ws.send_json({
@@ -364,7 +399,14 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                             from translate_comments.splitter import join_translations
                             for idx, chunk in enumerate(chunks):
                                 part = await loop.run_in_executor(
-                                    None, translator.translate, chunk
+                                    None,
+                                    lambda chunk=chunk, before=context_before, after=context_after, full_text=c.text:
+                                    translator.translate(
+                                        chunk,
+                                        context_before=before,
+                                        context_after=after,
+                                        related_text=full_text,
+                                    ),
                                 )
                                 translated_parts.append(part)
                                 partial = join_translations(translated_parts, c.text)
@@ -382,7 +424,13 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         result = await _chunked()
                     else:
                         result = await loop.run_in_executor(
-                            None, translator.translate, c.text
+                            None,
+                            lambda text=c.text, before=context_before, after=context_after:
+                            translator.translate(
+                                text,
+                                context_before=before,
+                                context_after=after,
+                            ),
                         )
 
                     translations[c.line_start] = result
@@ -396,6 +444,13 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                     total_translated += 1
 
                 except TranslationError as exc:
+                    file_untranslated += 1
+                    await ws.send_json({
+                        "type": "comment_failed",
+                        "path": path_str,
+                        "lineno": c.line_start,
+                        "message": str(exc),
+                    })
                     await ws.send_json({
                         "type": "log",
                         "message": f"翻译失败 L{c.line_start} ({path.name}): {exc}",
@@ -408,8 +463,17 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 "path": path_str,
                 "translated": file_translated,
                 "skipped": skipped,
+                "untranslated": file_untranslated,
                 "translations": {str(k): v for k, v in translations.items()},
             })
+
+            if file_untranslated > 0:
+                total_errors += 1
+                await ws.send_json({
+                    "type": "log",
+                    "message": f"{path.name} 有 {file_untranslated} 条注释未翻译，已停止后续文件处理。",
+                })
+                break
 
         await ws.send_json({
             "type": "all_done",
@@ -483,14 +547,14 @@ async def ws_translate_text(ws: WebSocket) -> None:
 
 @app.websocket("/ws/generate-comments")
 async def ws_generate_comments(ws: WebSocket) -> None:
-    """Stream Doxygen comment generation for selected functions.
+    """Stream Doxygen comment generation for selected header symbols.
 
-    Client sends:  {"path": "...", "function_lines": [N,...], "replace_existing": bool,
+    Client sends:  {"path": "...", "symbol_lines": [N,...], "replace_existing": bool,
                     "host": "...", "model": "..."}
     Server emits:
-        {"type": "function_started", "name": "...", "line": N}
+        {"type": "symbol_started",   "name": "...", "kind": "...", "line": N}
         {"type": "comment_chunk",    "name": "...", "partial": "..."}
-        {"type": "comment_done",     "name": "...", "line": N, "comment": "..."}
+        {"type": "comment_done",     "name": "...", "kind": "...", "line": N, "comment": "..."}
         {"type": "all_done",         "count": N}
         {"type": "error",            "message": "..."}
     """
@@ -507,44 +571,59 @@ async def ws_generate_comments(ws: WebSocket) -> None:
 
     try:
         path = Path(req.path)
-        source = path.read_text(encoding="utf-8", errors="replace")
-        all_funcs = parse_header(source)
+        all_symbols = analyze_header_file(path)
 
-        wanted = set(req.function_lines)
-        funcs = [f for f in all_funcs if f.line_start in wanted]
+        wanted = set(req.symbol_lines)
+        symbols = [symbol for symbol in all_symbols if symbol.line_start in wanted]
 
         translator = OllamaTranslator(host=req.host, model=req.model)
+        options = HeaderCommentOptions(
+            include_brief=req.include_brief,
+            include_params=req.include_params,
+            include_return=req.include_return,
+            author=req.author,
+            include_date=req.include_date,
+            date_format=req.date_format,
+            custom_tags=[HeaderTag(name=tag.name, value=tag.value) for tag in req.custom_tags],
+        )
         count = 0
 
-        for func in funcs:
-            if not req.replace_existing and func.has_comment:
+        for symbol in symbols:
+            if not req.replace_existing and symbol.has_comment:
                 continue
 
             await ws.send_json({
-                "type": "function_started",
-                "name": func.name,
-                "line": func.line_start,
+                "type": "symbol_started",
+                "name": symbol.name,
+                "kind": symbol.kind,
+                "line": symbol.line_start,
             })
 
             partial_buf: list[str] = []
 
-            def on_chunk(partial: str, name: str = func.name) -> None:
+            def on_chunk(partial: str, name: str = symbol.name, line: int = symbol.line_start) -> None:
                 partial_buf.clear()
                 partial_buf.append(partial)
                 asyncio.run_coroutine_threadsafe(
-                    ws.send_json({"type": "comment_chunk", "name": name, "partial": partial}),
+                    ws.send_json({"type": "comment_chunk", "name": name, "line": line, "partial": partial}),
                     loop,
                 )
 
             comment = await loop.run_in_executor(
                 None,
-                lambda f=func: generate_doxygen(f, translator, chunk_callback=on_chunk),
+                lambda current=symbol: generate_symbol_comment(
+                    current,
+                    translator,
+                    options,
+                    chunk_callback=on_chunk,
+                ),
             )
 
             await ws.send_json({
                 "type": "comment_done",
-                "name": func.name,
-                "line": func.line_start,
+                "name": symbol.name,
+                "kind": symbol.kind,
+                "line": symbol.line_start,
                 "comment": comment,
             })
             count += 1

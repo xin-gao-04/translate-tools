@@ -1,152 +1,318 @@
 import { useCallback, useRef, useState } from 'react'
-import type { FunctionInfo, HeaderWsEvent, Settings } from '../types'
-import { apiAnalyzeHeader, apiApplyComments, apiScan, startHeaderGeneration } from '../api'
+import type { HeaderConfig, HeaderSymbol, HeaderWsEvent, Settings } from '../types'
+import {
+  apiAnalyzeHeader,
+  apiApplyComments,
+  apiPreviewComments,
+  apiScan,
+  startHeaderGeneration,
+} from '../api'
 
 interface Props { settings: Settings }
 
+type HeaderFileStatus = 'pending' | 'running' | 'done' | 'error'
+
+interface HeaderFileEntry {
+  path: string
+  name: string
+  status: HeaderFileStatus
+  symbolCount: number
+  generatedCount: number
+}
+
+const HEADER_EXT_RE = /\.(h|hpp|hxx|hh|inl|ipp)$/i
+const FILE_ICONS: Record<HeaderFileStatus, string> = {
+  pending: '○',
+  running: '◐',
+  done: '●',
+  error: '✗',
+}
+
+const DEFAULT_CONFIG: HeaderConfig = {
+  replaceExisting: false,
+  includeBrief: true,
+  includeParams: true,
+  includeReturn: true,
+  author: '',
+  includeDate: false,
+  dateFormat: '%Y-%m-%d',
+  customTags: [],
+}
+
+const basename = (p: string) => p.replace(/\\/g, '/').split('/').pop() ?? p
+
 export default function HeaderPage({ settings }: Props) {
-  const HEADER_EXT_RE = /\.(h|hpp|hxx|hh)$/i
-  const [filePath,       setFilePath]       = useState<string | null>(null)
-  const [functions,      setFunctions]      = useState<FunctionInfo[]>([])
-  const [isAnalyzing,    setIsAnalyzing]    = useState(false)
-  const [isGenerating,   setIsGenerating]   = useState(false)
-  const [replaceExisting, setReplaceExisting] = useState(false)
-  const [statusMsg,      setStatusMsg]      = useState('拖放或选择 .h / .hpp 头文件')
-  const [expandedLine,   setExpandedLine]   = useState<number | null>(null)
+  const [files, setFiles] = useState<HeaderFileEntry[]>([])
+  const [symbolsByPath, setSymbolsByPath] = useState<Record<string, HeaderSymbol[]>>({})
+  const [diffsByPath, setDiffsByPath] = useState<Record<string, string>>({})
+  const [selectedFile, setSelectedFile] = useState<string | null>(null)
+  const [statusMsg, setStatusMsg] = useState('拖放文件夹或头文件开始分析')
+  const [isScanning, setIsScanning] = useState(false)
+  const [generatingPath, setGeneratingPath] = useState<string | null>(null)
+  const [previewingPath, setPreviewingPath] = useState<string | null>(null)
+  const [expandedLine, setExpandedLine] = useState<number | null>(null)
+  const [config, setConfig] = useState<HeaderConfig>(DEFAULT_CONFIG)
   const wsRef = useRef<{ stop: () => void } | null>(null)
   const dragCounter = useRef(0)
-  const [dragging,       setDragging]       = useState(false)
+  const [dragging, setDragging] = useState(false)
 
-  // ── File drop / browse ────────────────────────────────────────────────────
-
-  const loadFile = useCallback(async (path: string) => {
-    setFilePath(path)
-    setFunctions([])
-    setIsAnalyzing(true)
-    setStatusMsg('分析中…')
-    const result = await apiAnalyzeHeader(path)
-    if (result.error) {
-      setStatusMsg(`✗ ${result.error}`)
-    } else {
-      const funcs = (result.functions ?? []).map((f: FunctionInfo) => ({
-        ...f,
-        selected: !f.has_comment,
-        generate_status: 'idle' as const,
-      }))
-      setFunctions(funcs)
-      const noComment = funcs.filter(f => !f.has_comment).length
-      setStatusMsg(`已找到 ${funcs.length} 个函数，其中 ${noComment} 个无注释`)
-    }
-    setIsAnalyzing(false)
+  const updateFileEntry = useCallback((path: string, updater: (entry: HeaderFileEntry) => HeaderFileEntry) => {
+    setFiles(prev => {
+      const existing = prev.find(entry => entry.path === path)
+      if (!existing) {
+        return [...prev, updater({
+          path,
+          name: basename(path),
+          status: 'pending',
+          symbolCount: 0,
+          generatedCount: 0,
+        })]
+      }
+      return prev.map(entry => entry.path === path ? updater(entry) : entry)
+    })
   }, [])
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    void (async () => {
-      e.preventDefault()
-      dragCounter.current = 0
-      setDragging(false)
+  const clearDiffs = useCallback(() => {
+    setDiffsByPath({})
+  }, [])
 
-      const droppedPaths = Array.from(e.dataTransfer.files)
-        .map(f => (f as any).path ?? '')
-        .filter(Boolean)
+  const updateConfig = useCallback((partial: Partial<HeaderConfig>) => {
+    setConfig(prev => ({ ...prev, ...partial }))
+    clearDiffs()
+  }, [clearDiffs])
 
-      if (droppedPaths.length === 0) return
+  const syncFileFromSymbols = useCallback((path: string, symbols: HeaderSymbol[]) => {
+    const generatedCount = symbols.filter(symbol => !!symbol.generated_comment).length
+    updateFileEntry(path, entry => ({
+      ...entry,
+      status: generatedCount > 0 ? 'done' : 'pending',
+      symbolCount: symbols.length,
+      generatedCount,
+    }))
+  }, [updateFileEntry])
 
-      const directHeader = droppedPaths.find(path => HEADER_EXT_RE.test(path))
-      if (directHeader) {
-        await loadFile(directHeader)
-        return
-      }
-
-      setIsAnalyzing(true)
-      setStatusMsg('扫描头文件…')
-      try {
-        const { files } = await apiScan(droppedPaths)
-        const headerPath = files.find(path => HEADER_EXT_RE.test(path))
-        if (headerPath) {
-          await loadFile(headerPath)
-          return
-        }
-        setStatusMsg('未找到 .h / .hpp 头文件')
-      } finally {
-        setIsAnalyzing(false)
-      }
-    })()
-  }, [loadFile])
-
-  const handleBrowse = async () => {
-    const w = window as any
-    if (w.electronAPI?.openFile) {
-      const paths: string[] = await w.electronAPI.openFile()
-      if (paths.length) loadFile(paths[0])
-    }
-  }
-
-  // ── Selection helpers ─────────────────────────────────────────────────────
-
-  const toggleSelect = (lineStart: number) => {
-    setFunctions(fs => fs.map(f =>
-      f.line_start === lineStart ? { ...f, selected: !f.selected } : f
-    ))
-  }
-
-  const selectAll    = () => setFunctions(fs => fs.map(f => ({ ...f, selected: true })))
-  const selectNone   = () => setFunctions(fs => fs.map(f => ({ ...f, selected: false })))
-  const selectNoComment = () => setFunctions(fs => fs.map(f => ({ ...f, selected: !f.has_comment })))
-
-  // ── Generation ────────────────────────────────────────────────────────────
-
-  const handleGenerate = useCallback(() => {
-    if (!filePath || isGenerating) return
-    const selected = functions.filter(f =>
-      f.selected && (replaceExisting || !f.has_comment)
-    )
-    if (selected.length === 0) {
-      setStatusMsg('没有需要生成的函数（请检查选中项）')
+  const loadFile = useCallback(async (path: string, force = false) => {
+    if (!force && symbolsByPath[path]) {
       return
     }
 
-    setIsGenerating(true)
+    updateFileEntry(path, entry => ({ ...entry, status: 'running' }))
+    setStatusMsg(`分析中: ${basename(path)}`)
+
+    const result = await apiAnalyzeHeader(path)
+    if (result.error) {
+      updateFileEntry(path, entry => ({ ...entry, status: 'error' }))
+      setStatusMsg(`✗ ${result.error}`)
+      return
+    }
+
+    const symbols = (result.symbols ?? []).map(symbol => ({
+      ...symbol,
+      selected: !symbol.has_comment,
+      generate_status: 'idle' as const,
+    }))
+
+    setSymbolsByPath(prev => ({ ...prev, [path]: symbols }))
+    syncFileFromSymbols(path, symbols)
+    setStatusMsg(`已找到 ${symbols.length} 个对象（函数 + 变量）`)
+  }, [symbolsByPath, syncFileFromSymbols, updateFileEntry])
+
+  const handleSelectFile = useCallback(async (path: string) => {
+    setSelectedFile(path)
+    setExpandedLine(null)
+    await loadFile(path)
+  }, [loadFile])
+
+  const handleAddPaths = useCallback(async (paths: string[]) => {
+    setIsScanning(true)
+    setStatusMsg('扫描头文件…')
+    try {
+      const { files: scanned, errors } = await apiScan(paths)
+      const headerPaths = scanned.filter(path => HEADER_EXT_RE.test(path))
+      if (errors.length) {
+        console.warn('header scan errors:', errors)
+      }
+      if (headerPaths.length === 0) {
+        setStatusMsg('未找到 .h / .hpp / .inl / .ipp 头文件')
+        return
+      }
+
+      setFiles(prev => {
+        const existing = new Set(prev.map(entry => entry.path))
+        const added = headerPaths
+          .filter(path => !existing.has(path))
+          .map(path => ({
+            path,
+            name: basename(path),
+            status: 'pending' as const,
+            symbolCount: 0,
+            generatedCount: 0,
+          }))
+        return [...prev, ...added]
+      })
+
+      const firstPath = selectedFile ?? headerPaths[0]
+      setSelectedFile(firstPath)
+      await loadFile(firstPath)
+      setStatusMsg(`已载入 ${headerPaths.length} 个头文件`)
+    } finally {
+      setIsScanning(false)
+    }
+  }, [loadFile, selectedFile])
+
+  const currentSymbols = selectedFile ? (symbolsByPath[selectedFile] ?? []) : []
+  const currentDiff = selectedFile ? (diffsByPath[selectedFile] ?? '') : ''
+  const selectedSymbols = currentSymbols.filter(symbol => symbol.selected)
+  const generatedCount = currentSymbols.filter(symbol => symbol.generate_status === 'done').length
+  const previewReady = !!selectedFile && !!currentDiff
+
+  const updateCurrentSymbols = useCallback((updater: (symbols: HeaderSymbol[]) => HeaderSymbol[]) => {
+    if (!selectedFile) return
+    setSymbolsByPath(prev => {
+      const next = updater(prev[selectedFile] ?? [])
+      queueMicrotask(() => syncFileFromSymbols(selectedFile, next))
+      return { ...prev, [selectedFile]: next }
+    })
+  }, [selectedFile, syncFileFromSymbols])
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    dragCounter.current = 0
+    setDragging(false)
+    const droppedPaths = Array.from(e.dataTransfer.files)
+      .map(file => (file as any).path ?? '')
+      .filter(Boolean)
+    if (droppedPaths.length > 0) {
+      void handleAddPaths(droppedPaths)
+    }
+  }, [handleAddPaths])
+
+  const handleBrowseDir = async () => {
+    const w = window as any
+    if (w.electronAPI?.openDirectory) {
+      const paths: string[] = await w.electronAPI.openDirectory()
+      if (paths.length) {
+        await handleAddPaths(paths)
+      }
+    }
+  }
+
+  const handleBrowseFile = async () => {
+    const w = window as any
+    if (w.electronAPI?.openFile) {
+      const paths: string[] = await w.electronAPI.openFile()
+      if (paths.length) {
+        await handleAddPaths(paths)
+      }
+    }
+  }
+
+  const toggleSelect = (lineStart: number) => {
+    updateCurrentSymbols(symbols => symbols.map(symbol =>
+      symbol.line_start === lineStart ? { ...symbol, selected: !symbol.selected } : symbol
+    ))
+  }
+
+  const selectAll = () => updateCurrentSymbols(symbols => symbols.map(symbol => ({ ...symbol, selected: true })))
+  const selectNone = () => updateCurrentSymbols(symbols => symbols.map(symbol => ({ ...symbol, selected: false })))
+  const selectNoComment = () => updateCurrentSymbols(symbols => symbols.map(symbol => ({
+    ...symbol,
+    selected: !symbol.has_comment,
+  })))
+
+  const generatedCommentsFor = (path: string) => {
+    const comments: Record<string, string> = {}
+    for (const symbol of symbolsByPath[path] ?? []) {
+      if (symbol.generated_comment) {
+        comments[String(symbol.line_start)] = symbol.generated_comment
+      }
+    }
+    return comments
+  }
+
+  const handleGenerate = useCallback(() => {
+    if (!selectedFile || generatingPath) return
+
+    const symbols = symbolsByPath[selectedFile] ?? []
+    const targetSymbols = symbols.filter(symbol =>
+      symbol.selected && (config.replaceExisting || !symbol.has_comment)
+    )
+    if (targetSymbols.length === 0) {
+      setStatusMsg('没有需要生成的对象，请检查选择项或“替换已有注释”配置')
+      return
+    }
+
+    setGeneratingPath(selectedFile)
+    setDiffsByPath(prev => {
+      const next = { ...prev }
+      delete next[selectedFile]
+      return next
+    })
+    updateFileEntry(selectedFile, entry => ({ ...entry, status: 'running' }))
     setStatusMsg('生成注释中…')
 
-    // Reset statuses for selected functions
-    setFunctions(fs => fs.map(f =>
-      selected.some(s => s.line_start === f.line_start)
-        ? { ...f, generate_status: 'idle', generated_comment: undefined, generate_partial: undefined }
-        : f
-    ))
+    setSymbolsByPath(prev => ({
+      ...prev,
+      [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+        targetSymbols.some(target => target.line_start === symbol.line_start)
+          ? {
+              ...symbol,
+              generate_status: 'idle',
+              generated_comment: undefined,
+              generate_partial: undefined,
+            }
+          : symbol
+      ),
+    }))
 
     const onEvent = (evt: HeaderWsEvent) => {
       switch (evt.type) {
-        case 'function_started':
-          setFunctions(fs => fs.map(f =>
-            f.line_start === evt.line
-              ? { ...f, generate_status: 'running', generate_partial: '' }
-              : f
-          ))
+        case 'symbol_started':
+          setSymbolsByPath(prev => ({
+            ...prev,
+            [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+              symbol.line_start === evt.line
+                ? { ...symbol, generate_status: 'running', generate_partial: '' }
+                : symbol
+            ),
+          }))
           setStatusMsg(`生成注释: ${evt.name}`)
           break
         case 'comment_chunk':
-          setFunctions(fs => fs.map(f =>
-            f.name === evt.name && f.generate_status === 'running'
-              ? { ...f, generate_partial: evt.partial }
-              : f
-          ))
+          setSymbolsByPath(prev => ({
+            ...prev,
+            [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+              symbol.line_start === evt.line
+                ? { ...symbol, generate_status: 'running', generate_partial: evt.partial }
+                : symbol
+            ),
+          }))
           break
         case 'comment_done':
-          setFunctions(fs => fs.map(f =>
-            f.line_start === evt.line
-              ? { ...f, generate_status: 'done', generated_comment: evt.comment, generate_partial: undefined }
-              : f
-          ))
+          setSymbolsByPath(prev => {
+            const nextSymbols = (prev[selectedFile] ?? []).map(symbol =>
+              symbol.line_start === evt.line
+                ? {
+                    ...symbol,
+                    generate_status: 'done',
+                    generated_comment: evt.comment,
+                    generate_partial: undefined,
+                  }
+                : symbol
+            )
+            queueMicrotask(() => syncFileFromSymbols(selectedFile, nextSymbols))
+            return { ...prev, [selectedFile]: nextSymbols }
+          })
           break
         case 'all_done':
-          setIsGenerating(false)
-          setStatusMsg(`✓ 已为 ${evt.count} 个函数生成注释，点击「写入文件」应用`)
+          setGeneratingPath(null)
+          updateFileEntry(selectedFile, entry => ({ ...entry, status: 'done' }))
+          setStatusMsg(`✓ 已生成 ${evt.count} 条注释，先预览 diff 再写入文件`)
           wsRef.current = null
           break
         case 'error':
-          setIsGenerating(false)
+          setGeneratingPath(null)
+          updateFileEntry(selectedFile, entry => ({ ...entry, status: 'error' }))
           setStatusMsg(`✗ ${evt.message}`)
           wsRef.current = null
           break
@@ -155,148 +321,301 @@ export default function HeaderPage({ settings }: Props) {
 
     wsRef.current = startHeaderGeneration(
       settings,
-      filePath,
-      selected.map(f => f.line_start),
-      replaceExisting,
+      selectedFile,
+      targetSymbols.map(symbol => symbol.line_start),
+      config,
       onEvent,
     )
-  }, [filePath, functions, isGenerating, replaceExisting, settings])
+  }, [config, generatingPath, selectedFile, settings, symbolsByPath, syncFileFromSymbols, updateFileEntry])
 
   const handleStop = useCallback(() => {
     wsRef.current?.stop()
     wsRef.current = null
-    setIsGenerating(false)
+    setGeneratingPath(null)
+    if (selectedFile) {
+      updateFileEntry(selectedFile, entry => ({ ...entry, status: 'pending' }))
+    }
     setStatusMsg('已停止')
-  }, [])
+  }, [selectedFile, updateFileEntry])
+
+  const handlePreview = useCallback(async () => {
+    if (!selectedFile) return
+    const comments = generatedCommentsFor(selectedFile)
+    if (Object.keys(comments).length === 0) {
+      setStatusMsg('当前文件还没有生成注释')
+      return
+    }
+
+    setPreviewingPath(selectedFile)
+    setStatusMsg('生成 diff 预览…')
+    const result = await apiPreviewComments(selectedFile, comments, config.replaceExisting)
+    setPreviewingPath(null)
+
+    if (!result.ok) {
+      setStatusMsg(`✗ ${result.error ?? '预览失败'}`)
+      return
+    }
+
+    setDiffsByPath(prev => ({ ...prev, [selectedFile]: result.diff }))
+    setStatusMsg('✓ 已生成 diff 预览')
+  }, [config.replaceExisting, selectedFile, symbolsByPath])
 
   const handleApply = useCallback(async () => {
-    if (!filePath) return
-    const comments: Record<string, string> = {}
-    functions.forEach(f => {
-      if (f.generated_comment) comments[String(f.line_start)] = f.generated_comment
-    })
-    if (Object.keys(comments).length === 0) return
+    if (!selectedFile) return
+    const comments = generatedCommentsFor(selectedFile)
+    if (Object.keys(comments).length === 0) {
+      setStatusMsg('当前文件没有可写入的注释')
+      return
+    }
 
     setStatusMsg('写入文件…')
-    const result = await apiApplyComments(filePath, comments, replaceExisting)
-    if (result.ok) {
-      setStatusMsg(`✓ 已写入 ${Object.keys(comments).length} 条注释`)
-      // Mark applied functions as having comments now
-      setFunctions(fs => fs.map(f =>
-        f.generated_comment
-          ? { ...f, has_comment: true, existing_comment: f.generated_comment!, generated_comment: undefined, generate_status: 'idle' }
-          : f
-      ))
-    } else {
-      setStatusMsg(`✗ ${result.error}`)
+    const result = await apiApplyComments(selectedFile, comments, config.replaceExisting)
+    if (!result.ok) {
+      setStatusMsg(`✗ ${result.error ?? '写入失败'}`)
+      updateFileEntry(selectedFile, entry => ({ ...entry, status: 'error' }))
+      return
     }
-  }, [filePath, functions, replaceExisting])
 
-  // ── Render ────────────────────────────────────────────────────────────────
-
-  const hasDone = functions.some(f => f.generate_status === 'done')
+    setDiffsByPath(prev => {
+      const next = { ...prev }
+      delete next[selectedFile]
+      return next
+    })
+    await loadFile(selectedFile, true)
+    setStatusMsg(`✓ 已写入 ${Object.keys(comments).length} 条注释`)
+  }, [config.replaceExisting, loadFile, selectedFile, updateFileEntry, symbolsByPath])
 
   return (
     <div className="page-layout">
-      <div className="header-page">
+      <div className="header-workspace">
+        <div
+          className="sidebar"
+          onDragEnter={e => { e.preventDefault(); dragCounter.current++; setDragging(true) }}
+          onDragLeave={() => { dragCounter.current--; if (dragCounter.current === 0) setDragging(false) }}
+          onDragOver={e => e.preventDefault()}
+          onDrop={handleDrop}
+        >
+          <div className="sidebar-title">HEADERS</div>
 
-        {/* ── Left panel ── */}
-        <div className="header-sidebar">
-          <div className="sidebar-title">HEAD FILE</div>
-
-          {/* Drop zone */}
-          <div
-            className={`header-drop ${dragging ? 'drag-over' : ''}`}
-            onClick={handleBrowse}
-            onDragEnter={e => { e.preventDefault(); dragCounter.current++; setDragging(true) }}
-            onDragLeave={() => { dragCounter.current--; if (dragCounter.current === 0) setDragging(false) }}
-            onDragOver={e => e.preventDefault()}
-            onDrop={handleDrop}
-          >
-            {filePath
-              ? <span className="header-file-name">{filePath.split('/').pop()}</span>
-              : <>
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8L14 2z"/>
-                    <polyline points="14 2 14 8 20 8"/>
-                  </svg>
-                  <span>.h / .hpp</span>
-                  <span style={{ fontSize: 11, opacity: .6 }}>拖放或点击选择</span>
-                </>
-            }
-          </div>
-
-          {/* Options */}
-          <div className="header-options">
-            <label className="hdr-check">
-              <input
-                type="checkbox"
-                checked={replaceExisting}
-                onChange={e => setReplaceExisting(e.target.checked)}
-              />
-              <span>替换已有注释</span>
-            </label>
-          </div>
-
-          {/* Selection shortcuts */}
-          {functions.length > 0 && (
-            <div className="header-sel-row">
-              <button className="btn btn-ghost" style={{ flex: 1, height: 26, fontSize: 11 }} onClick={selectAll}>全选</button>
-              <button className="btn btn-ghost" style={{ flex: 1, height: 26, fontSize: 11 }} onClick={selectNone}>全取消</button>
-              <button className="btn btn-ghost" style={{ flex: 1, height: 26, fontSize: 11 }} onClick={selectNoComment}>仅无注释</button>
+          {files.length === 0 ? (
+            <div className={`drop-zone ${dragging ? 'drag-over' : ''}`} onClick={handleBrowseDir}>
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/>
+              </svg>
+              <span>拖放头文件或文件夹</span>
+              <span style={{ fontSize: 11, opacity: .6 }}>支持批量导入并按文件切换</span>
+            </div>
+          ) : (
+            <div className={`file-list ${dragging ? 'drag-over' : ''}`}>
+              {files.map(file => (
+                <div
+                  key={file.path}
+                  className={`file-item ${selectedFile === file.path ? 'active' : ''}`}
+                  onClick={() => void handleSelectFile(file.path)}
+                  title={file.path}
+                >
+                  <span className={`fi-badge ${file.status}`}>{FILE_ICONS[file.status]}</span>
+                  <span className="fi-name">{file.name}</span>
+                  <span className="fi-note">
+                    {file.generatedCount}/{file.symbolCount || '—'}
+                  </span>
+                </div>
+              ))}
             </div>
           )}
 
-          <div style={{ flex: 1 }} />
-
-          {/* Action buttons */}
-          <div className="header-actions">
-            <button
-              className="btn btn-primary"
-              style={{ width: '100%', marginBottom: 6 }}
-              onClick={isGenerating ? handleStop : handleGenerate}
-              disabled={!filePath || functions.length === 0 || isAnalyzing}
-            >
-              {isGenerating ? '■ 停止' : '▶ 生成注释'}
+          <div className="sidebar-btns">
+            <button className="btn btn-ghost" style={{ flex: 1, height: 28, fontSize: 12 }} onClick={handleBrowseDir}>
+              📁 文件夹
+            </button>
+            <button className="btn btn-ghost" style={{ flex: 1, height: 28, fontSize: 12 }} onClick={handleBrowseFile}>
+              📄 文件
             </button>
             <button
-              className="btn btn-apply"
-              style={{ width: '100%' }}
-              onClick={handleApply}
-              disabled={!hasDone}
+              className="btn btn-ghost"
+              style={{ height: 28, fontSize: 12, padding: '0 10px' }}
+              onClick={() => {
+                wsRef.current?.stop()
+                wsRef.current = null
+                setFiles([])
+                setSymbolsByPath({})
+                setDiffsByPath({})
+                setSelectedFile(null)
+                setGeneratingPath(null)
+                setPreviewingPath(null)
+                setStatusMsg('已清空头文件列表')
+              }}
             >
-              写入文件
+              清空
             </button>
           </div>
         </div>
 
-        {/* ── Function list ── */}
-        <div className="header-content">
-          {functions.length === 0 && !isAnalyzing && (
-            <div className="header-empty">
-              {filePath ? '未找到函数声明' : '选择头文件开始分析'}
+        <div className="header-main">
+          <div className="header-main-toolbar">
+            <div className="header-toolbar-group">
+              <label className="hdr-check">
+                <input
+                  type="checkbox"
+                  checked={config.replaceExisting}
+                  onChange={e => updateConfig({ replaceExisting: e.target.checked })}
+                />
+                <span>替换已有注释</span>
+              </label>
+              <label className="hdr-check">
+                <input
+                  type="checkbox"
+                  checked={config.includeBrief}
+                  onChange={e => updateConfig({ includeBrief: e.target.checked })}
+                />
+                <span>@brief</span>
+              </label>
+              <label className="hdr-check">
+                <input
+                  type="checkbox"
+                  checked={config.includeParams}
+                  onChange={e => updateConfig({ includeParams: e.target.checked })}
+                />
+                <span>@param</span>
+              </label>
+              <label className="hdr-check">
+                <input
+                  type="checkbox"
+                  checked={config.includeReturn}
+                  onChange={e => updateConfig({ includeReturn: e.target.checked })}
+                />
+                <span>@return</span>
+              </label>
             </div>
-          )}
-          {isAnalyzing && (
-            <div className="header-empty">分析中…</div>
-          )}
-          {functions.map(f => (
-            <FuncCard
-              key={f.line_start}
-              func={f}
-              expanded={expandedLine === f.line_start}
-              onToggleExpand={() => setExpandedLine(expandedLine === f.line_start ? null : f.line_start)}
-              onToggleSelect={() => toggleSelect(f.line_start)}
-            />
-          ))}
+
+            <div className="header-toolbar-group header-toolbar-inputs">
+              <input
+                className="header-config-input"
+                value={config.author}
+                onChange={e => updateConfig({ author: e.target.value })}
+                placeholder="作者标签（可选）"
+              />
+              <label className="hdr-check">
+                <input
+                  type="checkbox"
+                  checked={config.includeDate}
+                  onChange={e => updateConfig({ includeDate: e.target.checked })}
+                />
+                <span>附带日期</span>
+              </label>
+              <input
+                className="header-config-input header-config-input-small"
+                value={config.dateFormat}
+                onChange={e => updateConfig({ dateFormat: e.target.value })}
+                placeholder="%Y-%m-%d"
+              />
+              <input
+                className="header-config-input"
+                value={config.customTags.map(tag => tag.value ? `${tag.name}:${tag.value}` : tag.name).join(', ')}
+                onChange={e => {
+                  const tags = e.target.value
+                    .split(',')
+                    .map(part => part.trim())
+                    .filter(Boolean)
+                    .map(part => {
+                      const idx = part.indexOf(':')
+                      return idx >= 0
+                        ? { name: part.slice(0, idx).trim(), value: part.slice(idx + 1).trim() }
+                        : { name: part, value: '' }
+                    })
+                  updateConfig({ customTags: tags })
+                }}
+                placeholder="自定义标签，例：since:v2, owner:core"
+              />
+            </div>
+
+            <div className="header-toolbar-group">
+              <button className="btn btn-ghost" onClick={selectAll} disabled={!selectedFile || currentSymbols.length === 0}>
+                全选
+              </button>
+              <button className="btn btn-ghost" onClick={selectNone} disabled={!selectedFile || currentSymbols.length === 0}>
+                全取消
+              </button>
+              <button className="btn btn-ghost" onClick={selectNoComment} disabled={!selectedFile || currentSymbols.length === 0}>
+                仅无注释
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={generatingPath ? handleStop : handleGenerate}
+                disabled={!selectedFile || currentSymbols.length === 0 || isScanning}
+              >
+                {generatingPath ? '■ 停止' : '▶ 生成注释'}
+              </button>
+              <button
+                className="btn btn-blue"
+                onClick={handlePreview}
+                disabled={!selectedFile || previewingPath === selectedFile || generatedCount === 0}
+              >
+                {previewingPath === selectedFile ? '预览中…' : 'Diff 预览'}
+              </button>
+              <button
+                className="btn btn-apply"
+                onClick={handleApply}
+                disabled={!selectedFile || generatedCount === 0 || !previewReady}
+              >
+                写入文件
+              </button>
+            </div>
+          </div>
+
+          <div className="header-main-body">
+            <div className="header-symbol-list">
+              <div className="content-header">
+                {selectedFile ?? '— 左侧导入头文件并选择一个文件开始 —'}
+              </div>
+
+              {selectedFile && currentSymbols.length === 0 && (
+                <div className="header-empty">
+                  {isScanning ? '扫描中…' : '未找到变量或函数声明'}
+                </div>
+              )}
+
+              {!selectedFile && (
+                <div className="header-empty">
+                  选择文件后可查看函数、变量、实现定位和生成状态
+                </div>
+              )}
+
+              {currentSymbols.map(symbol => (
+                <SymbolCard
+                  key={`${symbol.kind}-${symbol.line_start}`}
+                  symbol={symbol}
+                  expanded={expandedLine === symbol.line_start}
+                  onToggleExpand={() => setExpandedLine(prev => prev === symbol.line_start ? null : symbol.line_start)}
+                  onToggleSelect={() => toggleSelect(symbol.line_start)}
+                />
+              ))}
+            </div>
+
+            <div className="header-preview-pane">
+              <div className="content-header">
+                Diff 预览
+              </div>
+              <div className="header-diff-wrap">
+                {currentDiff ? (
+                  <pre className="header-diff-code">{currentDiff}</pre>
+                ) : (
+                  <div className="header-empty">
+                    生成注释后点击 “Diff 预览”，确认差异再写入文件
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
       <div className="bottom-bar">
-        {isGenerating && (
-          <div className="progress-track" style={{ width: 200, marginRight: 10 }}>
-            <div className="progress-fill"
-              style={{ width: `${functions.filter(f => f.generate_status === 'done').length / Math.max(1, functions.filter(f => f.selected).length) * 100}%` }}
+        {generatingPath && (
+          <div className="progress-track" style={{ width: 220, marginRight: 10 }}>
+            <div
+              className="progress-fill"
+              style={{ width: `${selectedSymbols.length ? (generatedCount / selectedSymbols.length) * 100 : 0}%` }}
             />
           </div>
         )}
@@ -306,49 +625,50 @@ export default function HeaderPage({ settings }: Props) {
   )
 }
 
-// ── FuncCard ──────────────────────────────────────────────────────────────────
-
-interface FuncCardProps {
-  func: FunctionInfo
+interface SymbolCardProps {
+  symbol: HeaderSymbol
   expanded: boolean
   onToggleExpand: () => void
   onToggleSelect: () => void
 }
 
-function FuncCard({ func, expanded, onToggleExpand, onToggleSelect }: FuncCardProps) {
-  const status = func.generate_status ?? 'idle'
-  const partial = func.generate_partial ?? ''
-  const generated = func.generated_comment ?? ''
+function SymbolCard({ symbol, expanded, onToggleExpand, onToggleSelect }: SymbolCardProps) {
+  const status = symbol.generate_status ?? 'idle'
+  const partial = symbol.generate_partial ?? ''
+  const generated = symbol.generated_comment ?? ''
 
   const statusIcon =
     status === 'running' ? '◐'
-    : status === 'done'  ? '●'
-    : func.has_comment   ? '○'
+    : status === 'done' ? '●'
+    : symbol.has_comment ? '○'
     : '—'
 
   const statusClass =
     status === 'running' ? 'running'
-    : status === 'done'  ? 'done'
-    : func.has_comment   ? 'has-comment'
+    : status === 'done' ? 'done'
+    : symbol.has_comment ? 'has-comment'
     : 'no-comment'
 
   return (
     <div className={`func-card ${expanded ? 'expanded' : ''}`}>
-      {/* Header row */}
       <div className="func-card-row" onDoubleClick={onToggleExpand}>
         <input
           type="checkbox"
           className="func-select"
-          checked={!!func.selected}
+          checked={!!symbol.selected}
           onChange={onToggleSelect}
           onClick={e => e.stopPropagation()}
         />
         <span className={`func-status-icon ${statusClass}`}>{statusIcon}</span>
-        <span className="func-class">{func.class_context ? `${func.class_context}::` : ''}</span>
-        <span className="func-name">{func.name}</span>
-        <span className="func-line">L{func.line_start}</span>
-        <span className={`func-badge ${func.has_comment ? 'has' : 'no'}`}>
-          {func.has_comment ? '有注释' : '无注释'}
+        <span className={`header-kind-badge ${symbol.kind}`}>{symbol.kind === 'function' ? '函数' : '变量'}</span>
+        <span className="func-class">
+          {symbol.namespace_context ? `${symbol.namespace_context}::` : ''}
+          {symbol.class_context ? `${symbol.class_context}::` : ''}
+        </span>
+        <span className="func-name">{symbol.name}</span>
+        <span className="func-line">L{symbol.line_start}</span>
+        <span className={`func-badge ${symbol.has_comment ? 'has' : 'no'}`}>
+          {symbol.has_comment ? '有注释' : '无注释'}
         </span>
         <button
           className="func-expand-btn"
@@ -359,22 +679,27 @@ function FuncCard({ func, expanded, onToggleExpand, onToggleSelect }: FuncCardPr
         </button>
       </div>
 
-      {/* Expanded panel */}
       {expanded && (
         <div className="func-card-body">
-          {/* Signature */}
-          <div className="func-section-label">函数签名</div>
-          <pre className="func-code">{func.full_signature}</pre>
+          <div className="func-section-label">声明</div>
+          <pre className="func-code">{symbol.full_signature}</pre>
 
-          {/* Existing comment */}
-          {func.has_comment && func.existing_comment && (
+          {symbol.implementation_snippet && (
             <>
-              <div className="func-section-label">已有注释</div>
-              <pre className="func-code existing">{func.existing_comment}</pre>
+              <div className="func-section-label">
+                实现定位 {symbol.implementation_path ? `· ${basename(symbol.implementation_path)}` : ''}
+              </div>
+              <pre className="func-code implementation">{symbol.implementation_snippet}</pre>
             </>
           )}
 
-          {/* Generated comment (streaming or final) */}
+          {symbol.has_comment && symbol.existing_comment && (
+            <>
+              <div className="func-section-label">已有注释</div>
+              <pre className="func-code existing">{symbol.existing_comment}</pre>
+            </>
+          )}
+
           {(status === 'running' || status === 'done') && (
             <>
               <div className="func-section-label">

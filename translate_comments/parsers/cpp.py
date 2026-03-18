@@ -92,15 +92,34 @@ class CppParser(BaseParser):
                 start = i
                 line_start = _line_of(start)
                 col_start = _col_of(start)
-                i += 2
-                while i < n and src[i] != "\n":
-                    i += 1
+                text_lines: list[str] = []
+
+                while True:
+                    line_comment_start = i
+                    i += 2
+                    while i < n and src[i] != "\n":
+                        i += 1
+                    raw_line = src[line_comment_start:i]
+                    text_lines.append(raw_line[2:].strip())
+
+                    if i >= n or src[i] != "\n":
+                        break
+
+                    j = i + 1
+                    while j < n and src[j] in (" ", "\t"):
+                        j += 1
+                    next_col = _col_of(j) if j < n else 0
+                    if j + 1 < n and src[j] == "/" and src[j + 1] == "/" and next_col == col_start:
+                        i = j
+                        continue
+                    break
+
                 raw = src[start:i]
-                text = raw.lstrip("/").strip()
+                text = "\n".join(text_lines)
                 comments.append(Comment(
                     text=text,
                     line_start=line_start,
-                    line_end=line_start,
+                    line_end=_line_of(i - 1),
                     col_start=col_start,
                     style="line",
                     raw=raw,
@@ -193,8 +212,12 @@ class CppParser(BaseParser):
 
 def _rewrap(comment: Comment, text: str) -> str:
     if comment.style == "line":
-        # Keep single-line style; collapse any accidental newlines
-        return "// " + text.replace("\n", " ")
+        indent = " " * max(comment.col_start, 0)
+        lines = [line.strip() for line in text.splitlines()] or [text.strip()]
+        return "\n".join(
+            f"{indent}// {line}" if line else f"{indent}//"
+            for line in lines
+        )
 
     # Block / doc — rebuild with per-line " * " prefix when multiline
     lines = text.splitlines()

@@ -1,5 +1,6 @@
 import type {
-  FunctionInfo,
+  HeaderConfig,
+  HeaderSymbol,
   HeaderWsEvent,
   Settings,
   TextTranslateDirection,
@@ -55,11 +56,24 @@ export async function apiApply(translations: Record<string, Record<string, strin
   return r.json()
 }
 
-export async function apiAnalyzeHeader(path: string): Promise<{ functions: FunctionInfo[]; error?: string }> {
+export async function apiAnalyzeHeader(path: string): Promise<{ symbols: HeaderSymbol[]; error?: string }> {
   const r = await fetch(`${apiBase()}/api/analyze-header`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
+  })
+  return r.json()
+}
+
+export async function apiPreviewComments(
+  path: string,
+  comments: Record<string, string>,
+  replaceExisting: boolean,
+): Promise<{ ok: boolean; diff: string; preview: string; error?: string }> {
+  const r = await fetch(`${apiBase()}/api/preview-comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, comments, replace_existing: replaceExisting }),
   })
   return r.json()
 }
@@ -175,8 +189,8 @@ export function startTextTranslation(
 export function startHeaderGeneration(
   settings: Settings,
   path: string,
-  functionLines: number[],
-  replaceExisting: boolean,
+  symbolLines: number[],
+  config: HeaderConfig,
   onEvent: (e: HeaderWsEvent) => void,
 ): { stop: () => void } {
   const ws = new WebSocket(`${wsBase()}/ws/generate-comments`)
@@ -184,10 +198,17 @@ export function startHeaderGeneration(
   ws.onopen = () => {
     ws.send(JSON.stringify({
       path,
-      function_lines: functionLines,
-      replace_existing: replaceExisting,
+      symbol_lines: symbolLines,
+      replace_existing: config.replaceExisting,
       host: settings.host,
       model: settings.model,
+      include_brief: config.includeBrief,
+      include_params: config.includeParams,
+      include_return: config.includeReturn,
+      author: config.author,
+      include_date: config.includeDate,
+      date_format: config.dateFormat,
+      custom_tags: config.customTags,
     }))
   }
 

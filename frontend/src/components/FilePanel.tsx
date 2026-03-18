@@ -84,8 +84,11 @@ export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, o
             >
               <span className={`fi-badge ${f.status}`}>{ICONS[f.status]}</span>
               <span className="fi-name">{f.name}</span>
-              {f.translated > 0 && (
-                <span className="fi-note">+{f.translated}</span>
+              {f.total > 0 && (
+                <span className="fi-note">
+                  {f.translated}/{f.total}
+                  {(f.untranslated ?? 0) > 0 ? ` !${f.untranslated}` : ''}
+                </span>
               )}
             </div>
           ))}
@@ -106,4 +109,3 @@ export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, o
     </div>
   )
 }
-

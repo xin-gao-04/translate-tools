@@ -29,9 +29,6 @@ function startBackend () {
   if (!pythonCmd) return   // production bundling handled separately
 
   const exe = process.platform === 'win32' ? 'python' : 'python3'
-  const shimPath = isDev
-    ? path.join(__dirname, '..', 'python_shims')
-    : path.join(process.resourcesPath, 'python_shims')
 
   // In dev, run from the project root (one level up from frontend/)
   const cwd = isDev
@@ -43,7 +40,6 @@ function startBackend () {
     env: {
       ...process.env,
       PYTHONUNBUFFERED: '1',
-      PYTHONPATH: [shimPath, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     },
   })
 

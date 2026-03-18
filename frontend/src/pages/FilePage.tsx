@@ -22,12 +22,13 @@ type Action =
   | { type: 'ADD_FILES';       paths: string[] }
   | { type: 'CLEAR_FILES' }
   | { type: 'LOAD_COMMENTS';   path: string; rows: CommentRow[] }
-  | { type: 'FILE_STARTED';    path: string }
-  | { type: 'FILE_DONE';       path: string; translated: number; trans: Record<string, string> }
+  | { type: 'FILE_STARTED';    path: string; total: number }
+  | { type: 'FILE_DONE';       path: string; translated: number; untranslated: number; total: number; trans: Record<string, string> }
   | { type: 'FILE_ERROR';      path: string; message: string }
   | { type: 'COMMENT_RUNNING'; path: string; lineno: number; chunkTotal: number }
   | { type: 'COMMENT_CHUNK';   path: string; lineno: number; partial: string }
   | { type: 'COMMENT_DONE';    path: string; lineno: number; translated: string }
+  | { type: 'COMMENT_FAILED';  path: string; lineno: number; message: string }
   | { type: 'START_RUNNING' }
   | { type: 'ALL_DONE';        translated: number; errors: number }
   | { type: 'STATUS';          msg: string }
@@ -55,7 +56,12 @@ function reducer(state: State, action: Action): State {
       }
 
     case 'FILE_STARTED':
-      return { ...state, files: state.files.map(f => f.path === action.path ? { ...f, status: 'running' } : f) }
+      return {
+        ...state,
+        files: state.files.map(f =>
+          f.path === action.path ? { ...f, status: 'running', total: action.total, untranslated: 0 } : f
+        ),
+      }
 
     case 'FILE_DONE': {
       const newTrans = { ...state.translations, [action.path]: action.trans }
@@ -65,7 +71,15 @@ function reducer(state: State, action: Action): State {
         totalTranslated: state.totalTranslated + action.translated,
         translations: newTrans,
         files: state.files.map(f =>
-          f.path === action.path ? { ...f, status: 'done', translated: action.translated } : f
+          f.path === action.path
+            ? {
+                ...f,
+                status: action.untranslated > 0 ? 'error' : 'done',
+                translated: action.translated,
+                total: action.total,
+                untranslated: action.untranslated,
+              }
+            : f
         ),
       }
     }
@@ -106,6 +120,16 @@ function reducer(state: State, action: Action): State {
           ),
         },
       }
+    case 'COMMENT_FAILED':
+      return {
+        ...state,
+        comments: {
+          ...state.comments,
+          [action.path]: (state.comments[action.path] ?? []).map(r =>
+            r.lineno === action.lineno ? { ...r, status: 'error', translated: action.message } : r
+          ),
+        },
+      }
 
     case 'START_RUNNING':
       return { ...state, isRunning: true, doneFiles: 0, totalTranslated: 0 }
@@ -142,7 +166,7 @@ export default function FilePage({ settings }: Props) {
   const handleWsEvent = useCallback((evt: WsEvent) => {
     switch (evt.type) {
       case 'file_started':
-        dispatch({ type: 'FILE_STARTED', path: evt.path })
+        dispatch({ type: 'FILE_STARTED', path: evt.path, total: evt.english_count })
         setSelectedFile(evt.path)
         dispatch({ type: 'STATUS', msg: `翻译中: ${basename(evt.path)}  (${evt.english_count} 条英文注释)` })
         break
@@ -155,8 +179,19 @@ export default function FilePage({ settings }: Props) {
       case 'comment_done':
         dispatch({ type: 'COMMENT_DONE', path: evt.path, lineno: evt.lineno, translated: evt.translated })
         break
+      case 'comment_failed':
+        dispatch({ type: 'COMMENT_FAILED', path: evt.path, lineno: evt.lineno, message: evt.message })
+        dispatch({ type: 'STATUS', msg: `未翻译: ${basename(evt.path)} L${evt.lineno} — ${evt.message}` })
+        break
       case 'file_done':
-        dispatch({ type: 'FILE_DONE', path: evt.path, translated: evt.translated, trans: evt.translations ?? {} })
+        dispatch({
+          type: 'FILE_DONE',
+          path: evt.path,
+          translated: evt.translated,
+          untranslated: evt.untranslated,
+          total: evt.translated + evt.untranslated,
+          trans: evt.translations ?? {},
+        })
         break
       case 'file_error':
         dispatch({ type: 'FILE_ERROR', path: evt.path, message: evt.message })
@@ -240,6 +275,7 @@ export default function FilePage({ settings }: Props) {
   const currentRows = selectedFile ? (state.comments[selectedFile] ?? null) : null
   const doneRows    = currentRows?.filter(r => r.status === 'done').length ?? 0
   const engRows     = currentRows?.filter(r => r.isEnglish).length ?? 0
+  const hasBlockingErrors = state.files.some(f => f.status === 'error' || (f.untranslated ?? 0) > 0)
   const hasTranslations = Object.values(state.translations).some(t => Object.keys(t).length > 0)
 
   return (
@@ -275,7 +311,7 @@ export default function FilePage({ settings }: Props) {
         totalTranslated={state.totalTranslated}
         statusMsg={state.statusMsg}
         isRunning={state.isRunning}
-        canApply={hasTranslations && settings.outputMode !== 'inplace'}
+        canApply={hasTranslations && !hasBlockingErrors && settings.outputMode !== 'inplace'}
         onStart={handleStart}
         onStop={handleStop}
         onApply={handleApply}

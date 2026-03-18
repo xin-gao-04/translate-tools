@@ -6,6 +6,7 @@ export interface FileEntry {
   status: FileStatus
   translated: number
   total: number
+  untranslated?: number
 }
 
 export interface CommentRow {
@@ -15,7 +16,7 @@ export interface CommentRow {
   original: string
   translated: string
   isEnglish: boolean
-  status: 'pending' | 'running' | 'done' | 'skipped'
+  status: 'pending' | 'running' | 'done' | 'skipped' | 'error'
   chunkTotal: number
   contextBefore: string[]   // source lines before the comment
   contextAfter: string[]    // source lines after the comment
@@ -26,7 +27,8 @@ export type WsEvent =
   | { type: 'comment_started'; path: string; lineno: number; chunk_total: number }
   | { type: 'comment_chunk';   path: string; lineno: number; partial: string; chunk_idx: number; chunk_total: number }
   | { type: 'comment_done';    path: string; lineno: number; translated: string }
-  | { type: 'file_done';       path: string; translated: number; skipped: number; translations: Record<string,string> }
+  | { type: 'comment_failed';  path: string; lineno: number; message: string }
+  | { type: 'file_done';       path: string; translated: number; skipped: number; untranslated: number; translations: Record<string,string> }
   | { type: 'file_error';      path: string; message: string }
   | { type: 'all_done';        files: number; translated: number; errors: number }
   | { type: 'log';             message: string }
@@ -39,23 +41,43 @@ export type TextWsEvent =
 
 export type TextTranslateDirection = 'en_to_zh' | 'zh_to_en'
 
+export interface HeaderTag {
+  name: string
+  value: string
+}
+
+export interface HeaderConfig {
+  replaceExisting: boolean
+  includeBrief: boolean
+  includeParams: boolean
+  includeReturn: boolean
+  author: string
+  includeDate: boolean
+  dateFormat: string
+  customTags: HeaderTag[]
+}
+
 export type HeaderWsEvent =
-  | { type: 'function_started'; name: string; line: number }
-  | { type: 'comment_chunk';    name: string; partial: string }
-  | { type: 'comment_done';     name: string; line: number; comment: string }
+  | { type: 'symbol_started';   name: string; kind: HeaderSymbol['kind']; line: number }
+  | { type: 'comment_chunk';    name: string; line: number; partial: string }
+  | { type: 'comment_done';     name: string; kind: HeaderSymbol['kind']; line: number; comment: string }
   | { type: 'all_done';         count: number }
   | { type: 'error';            message: string }
 
-export interface FunctionInfo {
+export interface HeaderSymbol {
+  kind: 'function' | 'variable'
   name: string
   full_signature: string
   line_start: number
   line_end: number
   class_context: string
+  namespace_context: string
   has_comment: boolean
   existing_comment: string
   comment_line_start: number
   comment_line_end: number
+  implementation_path: string
+  implementation_snippet: string
   // UI state (added locally, not from server)
   selected?: boolean
   generated_comment?: string

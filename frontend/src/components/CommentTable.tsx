@@ -71,12 +71,14 @@ function Row({ row, expanded, onToggle }: { row: CommentRow; expanded: boolean; 
 
   const trClass = row.isEnglish
     ? row.status === 'running' ? 'td-tr running'
+    : row.status === 'error'  ? 'td-tr error'
     : row.status === 'done'   ? 'td-tr'
     : 'td-tr empty'
     : 'td-tr skipped'
 
   const trText = !row.isEnglish ? '—'
     : row.status === 'running' ? (row.translated ? disp(row.translated) + ' …' : '翻译中…')
+    : row.status === 'error'   ? (row.translated ? disp(row.translated) : '未翻译')
     : row.translated ? disp(row.translated)
     : ''
 
@@ -146,11 +148,17 @@ function ContextPanel({ row }: { row: CommentRow }) {
 
         <div className="context-translation">
           <div className="context-label">
-            {row.status === 'done' ? '译文' : row.status === 'running' ? '翻译中…' : '原文（待翻译）'}
+            {row.status === 'done'
+              ? '译文'
+              : row.status === 'running'
+                ? '翻译中…'
+                : row.status === 'error'
+                  ? '未翻译（请先处理错误）'
+                  : '原文（待翻译）'}
           </div>
           <div className="context-code">
             <pre className="ctx-translated">
-              {row.status === 'done' || row.status === 'running'
+              {row.status === 'done' || row.status === 'running' || row.status === 'error'
                 ? (row.translated || '…')
                 : row.original}
             </pre>
