@@ -39,3 +39,24 @@ public:
         (9, "~A", "A"),
         (10, "ok", "A"),
     ]
+
+
+def test_parses_namespace_wrapped_declarations() -> None:
+    source = """
+namespace demo {
+class Foo {
+public:
+    Foo();
+    ~Foo();
+    void ok();
+};
+
+void free_func();
+}
+"""
+    assert _names(source) == [
+        (5, "Foo", "Foo"),
+        (6, "~Foo", "Foo"),
+        (7, "ok", "Foo"),
+        (10, "free_func", ""),
+    ]

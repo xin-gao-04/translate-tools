@@ -214,6 +214,17 @@ _FUNC_RE = re.compile(
     + r"(?:;|\{|=\s*(?:0|default|delete)\s*;)",  # terminator
 )
 
+_CLASS_SCOPE_RE = re.compile(r"\s*(class|struct)\s+(\w+)[^;{]*(?:\{|$)")
+_NAMESPACE_SCOPE_RE = re.compile(r"\s*(?:inline\s+)?namespace(?:\s+([\w:]+))?[^;{]*(?:\{|$)")
+
+
+def _class_context(scope_stack: list[tuple[str, str, int]]) -> str:
+    """Return the innermost class/struct scope name, if any."""
+    for kind, name, _depth in reversed(scope_stack):
+        if kind in {"class", "struct"} and name:
+            return name
+    return ""
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -225,6 +236,7 @@ def parse_header(source: str) -> list[FunctionInfo]:
 
     Handles:
     * ``class Foo {`` and ``class Foo\\n{`` (brace on next line)
+    * ``namespace demo { ... }`` and ``inline namespace v1 { ... }``
     * Constructors, destructors, and plain methods
     * Multi-line declarations (accumulated until parens balance)
     * Only looks for declarations at declaration depth (skips function bodies)
@@ -233,15 +245,16 @@ def parse_header(source: str) -> list[FunctionInfo]:
     proc_lines = _preprocess(source)
 
     results: list[FunctionInfo] = []
-    class_stack: list[str] = []
+    scope_stack: list[tuple[str, str, int]] = []
     brace_depth = 0          # total open braces
-    pending_class: str | None = None   # class whose { hasn't appeared yet
+    pending_scope: tuple[str, str] | None = None   # scope whose { hasn't appeared yet
     seen_lines: set[int] = set()
 
     i = 0
     while i < len(proc_lines):
         raw = proc_lines[i]
         stripped = raw.strip()
+        line_start_depth = brace_depth
 
         # ── STEP 1: unconditionally track braces ──────────────────────────
         #   This must happen before any ``continue`` so we never lose depth.
@@ -249,31 +262,33 @@ def parse_header(source: str) -> list[FunctionInfo]:
         opens  = raw.count("{")
         closes = raw.count("}")
 
-        # If there's a pending class name (class Foo on its own line),
-        # the first { on the NEXT non-empty line belongs to that class.
-        if opens > 0 and pending_class is not None:
-            class_stack.append(pending_class)
-            pending_class = None
+        opened_scopes: list[tuple[str, str, int]] = []
 
-        brace_depth += opens - closes
-
-        # Pop class_stack when a closing brace reaches the right depth
-        # (each entry was pushed when brace_depth was already incremented)
-        # We track "class was opened at depth N" implicitly via stack length:
-        # when brace_depth drops below len(class_stack), the top class closed.
-        while class_stack and brace_depth < len(class_stack):
-            class_stack.pop()
-
-        # ── STEP 2: detect class/struct declarations ──────────────────────
-        cls_m = re.match(r"\s*(?:class|struct)\s+(\w+)[^;{]*(?:\{|$)", raw)
-        if cls_m:
-            cls_name = cls_m.group(1)
+        # ── STEP 2: detect class/struct/namespace declarations ────────────
+        class_m = _CLASS_SCOPE_RE.match(raw)
+        namespace_m = _NAMESPACE_SCOPE_RE.match(raw)
+        if class_m:
+            kind, name = class_m.group(1), class_m.group(2)
             if "{" in raw:
-                # class opens on this line — already counted in opens above
-                class_stack.append(cls_name)
+                opened_scopes.append((kind, name, line_start_depth + 1))
             else:
-                # class is declared alone; { will appear on a later line
-                pending_class = cls_name
+                pending_scope = (kind, name)
+        elif namespace_m:
+            name = namespace_m.group(1) or ""
+            if "{" in raw:
+                opened_scopes.append(("namespace", name, line_start_depth + 1))
+            else:
+                pending_scope = ("namespace", name)
+        elif opens > 0 and pending_scope is not None:
+            opened_scopes.append((pending_scope[0], pending_scope[1], line_start_depth + 1))
+            pending_scope = None
+
+        brace_depth = line_start_depth + opens - closes
+        scope_stack.extend(opened_scopes)
+        while scope_stack and brace_depth < scope_stack[-1][2]:
+            scope_stack.pop()
+
+        if class_m or namespace_m:
             i += 1
             continue
 
@@ -289,10 +304,9 @@ def parse_header(source: str) -> list[FunctionInfo]:
             continue
 
         # ── STEP 4: skip if inside a function/method body ─────────────────
-        #   class_stack has one entry per open class brace.
-        #   brace_depth == len(class_stack) means we're directly at class body.
-        #   brace_depth > len(class_stack) means we're inside a nested { }.
-        if brace_depth > len(class_stack):
+        # ``scope_stack`` tracks declaration scopes (namespace/class/struct).
+        # When brace depth exceeds open declaration scopes, we're inside a body.
+        if brace_depth > len(scope_stack):
             i += 1
             continue
 
@@ -326,7 +340,7 @@ def parse_header(source: str) -> list[FunctionInfo]:
                         full_signature=sig,
                         line_start=decl_start + 1,
                         line_end=decl_end + 1,
-                        class_context=class_stack[-1] if class_stack else "",
+                        class_context=_class_context(scope_stack),
                         has_comment=cs >= 0,
                         existing_comment=ct,
                         comment_line_start=cs + 1 if cs >= 0 else -1,
