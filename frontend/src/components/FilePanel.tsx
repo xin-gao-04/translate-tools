@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
-import type { FileEntry } from '../types'
+import type { FileEntry, FileFilterOption } from '../types'
 
 const ICONS: Record<string, string> = {
   pending: '○', running: '◐', done: '●', error: '✗', skipped: '—',
@@ -8,12 +8,30 @@ const ICONS: Record<string, string> = {
 interface Props {
   files: FileEntry[]
   selectedFile: string | null
+  filters: FileFilterOption[]
+  activeFilters: string[]
+  onToggleFilter: (key: string) => void
   onSelect: (path: string) => void
+  onToggleSelect: (path: string) => void
+  onSelectAll: () => void
+  onSelectNone: () => void
   onAddPaths: (paths: string[]) => void
   onClear: () => void
 }
 
-export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, onClear }: Props) {
+export default function FilePanel({
+  files,
+  selectedFile,
+  filters,
+  activeFilters,
+  onToggleFilter,
+  onSelect,
+  onToggleSelect,
+  onSelectAll,
+  onSelectNone,
+  onAddPaths,
+  onClear,
+}: Props) {
   const dragCounter = useRef(0)
   const [dragging, setDragging] = useState(false)
 
@@ -62,6 +80,19 @@ export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, o
     >
       <div className="sidebar-title">FILES</div>
 
+      <div className="filter-panel">
+        {filters.map(filter => (
+          <label key={filter.key} className="filter-check">
+            <input
+              type="checkbox"
+              checked={activeFilters.includes(filter.key)}
+              onChange={() => onToggleFilter(filter.key)}
+            />
+            <span>{filter.label}</span>
+          </label>
+        ))}
+      </div>
+
       {files.length === 0 ? (
         <div
           className={`drop-zone ${dragging ? 'drag-over' : ''}`}
@@ -82,6 +113,14 @@ export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, o
               onClick={() => onSelect(f.path)}
               title={f.path}
             >
+              <input
+                type="checkbox"
+                className="fi-check"
+                checked={f.selected}
+                onChange={() => onToggleSelect(f.path)}
+                onClick={e => e.stopPropagation()}
+                title="选择此文件用于写回"
+              />
               <span className={`fi-badge ${f.status}`}>{ICONS[f.status]}</span>
               <span className="fi-name">{f.name}</span>
               {f.total > 0 && (
@@ -96,6 +135,12 @@ export default function FilePanel({ files, selectedFile, onSelect, onAddPaths, o
       )}
 
       <div className="sidebar-btns">
+        <button className="btn btn-ghost" style={{ height: 28, fontSize: 12, padding: '0 10px' }} onClick={onSelectAll}>
+          全选
+        </button>
+        <button className="btn btn-ghost" style={{ height: 28, fontSize: 12, padding: '0 10px' }} onClick={onSelectNone}>
+          全不选
+        </button>
         <button className="btn btn-ghost" style={{ flex: 1, height: 28, fontSize: 12 }} onClick={handleBrowseDir}>
           📁 文件夹
         </button>

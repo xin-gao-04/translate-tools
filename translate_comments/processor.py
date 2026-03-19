@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from translate_comments.detector import is_english
-from translate_comments.parsers import get_parser
+from translate_comments.parsers import get_parser_for_path
 from translate_comments.parsers.base import Comment
 from translate_comments.scanner import FileScanner
 from translate_comments.translator import OllamaTranslator, TranslationError
@@ -145,9 +145,9 @@ class Processor:
             return result
 
         # 2. Select parser
-        parser = get_parser(path.suffix)
+        parser = get_parser_for_path(str(path))
         if parser is None:
-            result.error = f"No parser for extension '{path.suffix}'"
+            result.error = f"No parser for file '{path.name}'"
             self._log(f"  [skip] {result.error}")
             return result
 

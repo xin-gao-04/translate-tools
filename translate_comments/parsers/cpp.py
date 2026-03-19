@@ -213,11 +213,13 @@ class CppParser(BaseParser):
 def _rewrap(comment: Comment, text: str) -> str:
     if comment.style == "line":
         indent = " " * max(comment.col_start, 0)
-        lines = [line.strip() for line in text.splitlines()] or [text.strip()]
-        return "\n".join(
+        lines = _fit_line_comment_lines(comment, text)
+        first = f"// {lines[0]}" if lines[0] else "//"
+        rest = [
             f"{indent}// {line}" if line else f"{indent}//"
-            for line in lines
-        )
+            for line in lines[1:]
+        ]
+        return "\n".join([first, *rest])
 
     # Block / doc — rebuild with per-line " * " prefix when multiline
     lines = text.splitlines()
@@ -240,3 +242,87 @@ def _rewrap(comment: Comment, text: str) -> str:
     body      = "\n".join(f"{indent} * {l}" for l in lines)
     close_tag = f"{indent} */"
     return f"{open_tag}\n{body}\n{close_tag}"
+
+
+def _fit_line_comment_lines(comment: Comment, text: str) -> list[str]:
+    """Fit translated text back into the original grouped // line count."""
+    original_count = max(comment.raw.count("\n") + 1, 1)
+    raw_lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in raw_lines if line]
+
+    if not lines:
+        stripped = text.strip()
+        return [stripped] if stripped else [""]
+
+    if len(lines) == original_count:
+        return lines
+
+    if len(lines) > original_count:
+        merged: list[str] = []
+        idx = 0
+        remaining = len(lines)
+        for slot in range(original_count):
+            slots_left = original_count - slot
+            take = max(1, remaining - (slots_left - 1))
+            chunk = " ".join(lines[idx:idx + take]).strip()
+            merged.append(chunk)
+            idx += take
+            remaining -= take
+        return merged
+
+    single = " ".join(lines).strip()
+    segments = _split_text_to_segments(single, original_count)
+    return segments if segments else [single]
+
+
+def _split_text_to_segments(text: str, count: int) -> list[str]:
+    if count <= 1 or not text:
+        return [text.strip()] if text.strip() else [""]
+
+    sentence_parts = [
+        part.strip()
+        for part in re.split(r"(?<=[。！？!?；;])\s+|(?<=[.])\s+(?=[A-Z])", text)
+        if part.strip()
+    ]
+    if len(sentence_parts) >= count:
+        return _merge_to_target_count(sentence_parts, count)
+
+    words = text.split()
+    if len(words) >= count:
+        base, extra = divmod(len(words), count)
+        result: list[str] = []
+        start = 0
+        for idx in range(count):
+            size = base + (1 if idx < extra else 0)
+            result.append(" ".join(words[start:start + size]).strip())
+            start += size
+        return [item for item in result if item]
+
+    chars = [ch for ch in text if ch.strip()]
+    if len(chars) >= count:
+        base, extra = divmod(len(chars), count)
+        result = []
+        start = 0
+        for idx in range(count):
+            size = base + (1 if idx < extra else 0)
+            result.append("".join(chars[start:start + size]).strip())
+            start += size
+        return [item for item in result if item]
+
+    return [text.strip()]
+
+
+def _merge_to_target_count(parts: list[str], count: int) -> list[str]:
+    if len(parts) <= count:
+        return parts
+
+    result: list[str] = []
+    idx = 0
+    remaining = len(parts)
+    for slot in range(count):
+        slots_left = count - slot
+        take = max(1, remaining - (slots_left - 1))
+        result.append(" ".join(parts[idx:idx + take]).strip())
+        idx += take
+        remaining -= take
+    return result

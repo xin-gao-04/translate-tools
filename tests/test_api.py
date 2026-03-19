@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from translate_comments.api import app
-from translate_comments.translator import TranslationError
+from translate_comments.translator import TranslationError, sanitize_translation_output
 
 
 client = TestClient(app)
@@ -143,3 +143,19 @@ int value = 3;
     assert not any(event.get("path") == str(second) and event["type"] == "file_started" for event in events)
     assert any(event["type"] == "comment_failed" for event in events)
     assert "int first_value = 1;" in FakeTranslator.calls[0][2]
+
+
+def test_sanitize_translation_output_strips_prompt_echo() -> None:
+    raw = """
+Use the surrounding source context only to disambiguate meaning.
+Translate only the comment text itself.
+
+初始化控件
+""".strip()
+
+    assert sanitize_translation_output(raw, "Initialize the widget") == "初始化控件"
+
+
+def test_sanitize_translation_output_keeps_normal_translation() -> None:
+    raw = "计算所有可见项目的包围盒"
+    assert sanitize_translation_output(raw, "Compute the bounding box for all visible items") == raw

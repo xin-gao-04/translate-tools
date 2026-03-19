@@ -2,13 +2,27 @@ import type { Settings } from '../types'
 
 interface Props {
   settings: Settings
+  models: string[]
+  modelsLoading: boolean
+  modelsMsg?: string
   onSettings: (s: Settings) => void
   onCheck: () => void
+  onReloadModels: () => void
   checkMsg?: string
 }
 
-export default function Toolbar({ settings, onSettings, onCheck, checkMsg }: Props) {
+export default function Toolbar({
+  settings,
+  models,
+  modelsLoading,
+  modelsMsg,
+  onSettings,
+  onCheck,
+  onReloadModels,
+  checkMsg,
+}: Props) {
   const set = (partial: Partial<Settings>) => onSettings({ ...settings, ...partial })
+  const selectedModel = models.includes(settings.model) ? settings.model : '__custom__'
 
   return (
     <div className="toolbar">
@@ -25,18 +39,45 @@ export default function Toolbar({ settings, onSettings, onCheck, checkMsg }: Pro
 
       <div className="toolbar-sep" />
       <label>模型</label>
+      <select
+        className="model-select"
+        value={selectedModel}
+        onChange={e => {
+          const value = e.target.value
+          if (value !== '__custom__') {
+            set({ model: value })
+          }
+        }}
+        disabled={modelsLoading || models.length === 0}
+      >
+        {models.length === 0 ? (
+          <option value="__custom__">无可用模型</option>
+        ) : (
+          <>
+            {models.map(m => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+            <option value="__custom__">自定义模型…</option>
+          </>
+        )}
+      </select>
       <input
         className="model"
-        list="model-list"
         value={settings.model}
         onChange={e => set({ model: e.target.value })}
-        placeholder="qwen2.5:7b"
+        placeholder={modelsLoading ? '加载模型中…' : '可手输任意模型名'}
       />
-      <datalist id="model-list">
-        {['qwen2.5:7b','qwen2.5:14b','qwen2.5:32b','llama3.2','mistral'].map(m => (
-          <option key={m} value={m} />
-        ))}
-      </datalist>
+      <button
+        className="btn btn-ghost toolbar-mini-btn"
+        onClick={onReloadModels}
+        disabled={modelsLoading}
+        title="从当前 Ollama Host 读取模型列表"
+      >
+        {modelsLoading ? '读取中…' : '刷新模型'}
+      </button>
+      {modelsMsg && (
+        <span className="toolbar-model-msg">{modelsMsg}</span>
+      )}
 
       <div className="toolbar-sep" />
       <label>输出</label>

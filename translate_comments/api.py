@@ -46,7 +46,7 @@ from translate_comments.header_workflow import (
     apply_header_comments,
     preview_header_comments,
 )
-from translate_comments.parsers import get_parser
+from translate_comments.parsers import get_parser_for_path
 from translate_comments.scanner import FileScanner
 from translate_comments.splitter import split_for_translation
 from translate_comments.translator import OllamaTranslator, TranslationError
@@ -70,6 +70,7 @@ class ScanRequest(BaseModel):
         ".cpp", ".cxx", ".cc", ".c",
         ".h", ".hpp", ".hxx", ".hh",
         ".inl", ".ipp",
+        ".cmake", "CMakeLists.txt",
     ]
     recursive: bool = True
 
@@ -158,6 +159,16 @@ async def check(host: str = "http://localhost:11434", model: str = "qwen2.5:7b")
     return {"ok": ok, "message": msg}
 
 
+@app.get("/api/models")
+async def list_models(host: str = "http://localhost:11434") -> dict:
+    """Return available model names from Ollama."""
+    try:
+        models = OllamaTranslator(host=host).list_models()
+        return {"ok": True, "models": models, "message": f"Loaded {len(models)} models."}
+    except TranslationError as exc:
+        return {"ok": False, "models": [], "message": str(exc)}
+
+
 @app.post("/api/comments")
 async def get_comments(req: ScanRequest) -> dict:
     """Parse and return all comments for the given files, including source context."""
@@ -165,7 +176,7 @@ async def get_comments(req: ScanRequest) -> dict:
     CONTEXT = 4  # lines of context to include on each side
     for path_str in req.paths:
         path = Path(path_str)
-        parser = get_parser(path.suffix)
+        parser = get_parser_for_path(path_str)
         if not parser:
             continue
         try:
@@ -270,9 +281,9 @@ async def apply(req: ApplyRequest) -> dict:
     errors:  list[str] = []
     for path_str, trans_map in req.translations.items():
         path = Path(path_str)
-        parser = get_parser(path.suffix)
+        parser = get_parser_for_path(path_str)
         if not parser:
-            errors.append(f"No parser for {path.suffix}")
+            errors.append(f"No parser for {path.name}")
             continue
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
@@ -336,11 +347,11 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
 
             source_lines = source.splitlines()
 
-            parser = get_parser(path.suffix)
+            parser = get_parser_for_path(path_str)
             if not parser:
                 await ws.send_json({
                     "type": "file_error", "path": path_str,
-                    "message": f"No parser for {path.suffix}",
+                    "message": f"No parser for {path.name}",
                 })
                 total_errors += 1
                 continue

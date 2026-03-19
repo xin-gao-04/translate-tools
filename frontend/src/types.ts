@@ -7,6 +7,7 @@ export interface FileEntry {
   translated: number
   total: number
   untranslated?: number
+  selected: boolean
 }
 
 export interface CommentRow {
@@ -90,4 +91,10 @@ export interface Settings {
   model: string
   outputMode: 'inplace' | 'stdout' | 'diff'
   apiPort: number
+}
+
+export interface FileFilterOption {
+  key: string
+  label: string
+  extensions: string[]
 }

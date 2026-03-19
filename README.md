@@ -174,6 +174,26 @@ cd frontend
 npm run dev
 ```
 
+### Windows 一键启动
+
+仓库根目录提供了两个入口：
+
+```powershell
+# PowerShell
+.\start-dev.ps1
+
+# 或 cmd / 双击
+start-dev.cmd
+```
+
+脚本会自动：
+
+- 将仓库内 `.venv\Scripts` 放到 `PATH` 前面
+- 启动 Vite 开发服务 `http://127.0.0.1:5173`
+- 启动 Electron 图形界面
+- 由 Electron 自动拉起 Python 后端 `http://127.0.0.1:8765`
+- 在 Electron 关闭后清理 Vite 进程
+
 ### 三个功能页面
 
 #### 📁 文件翻译（Files）

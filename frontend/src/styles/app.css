@@ -78,7 +78,13 @@ html, body, #root { height: 100%; overflow: hidden; }
 .toolbar select:focus { border-color: var(--accent); }
 .toolbar input.host  { width: 200px; }
 .toolbar input.model { width: 155px; }
+.toolbar select.model-select { width: 170px; }
 .toolbar select.output { width: 170px; }
+.toolbar-mini-btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+}
 
 /* ── Main area (FilePage layout) ── */
 .main-area {
@@ -110,6 +116,27 @@ html, body, #root { height: 100%; overflow: hidden; }
   user-select: none;
 }
 
+.filter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #A8C0D6;
+  font-size: 12px;
+  user-select: none;
+}
+
+.filter-check input {
+  cursor: pointer;
+}
+
 /* File list */
 .file-list {
   flex: 1;
@@ -126,6 +153,10 @@ html, body, #root { height: 100%; overflow: hidden; }
   cursor: pointer;
   transition: background .1s;
   user-select: none;
+}
+.file-item .fi-check {
+  flex-shrink: 0;
+  cursor: pointer;
 }
 .file-item:hover            { background: #1C2A3A; }
 .file-item.active           { background: #1C3A55; }
@@ -360,6 +391,15 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
   font-size: 11.5px;
   color: var(--text-secondary);
   max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolbar-model-msg {
+  font-size: 11px;
+  color: #4A6582;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

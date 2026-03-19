@@ -1,5 +1,5 @@
 import { useCallback, useReducer, useRef, useState } from 'react'
-import type { CommentRow, FileEntry, Settings, WsEvent } from '../types'
+import type { CommentRow, FileEntry, FileFilterOption, Settings, WsEvent } from '../types'
 import { apiApply, apiComments, apiScan, startTranslation } from '../api'
 import FilePanel from '../components/FilePanel'
 import CommentTable from '../components/CommentTable'
@@ -21,6 +21,9 @@ interface State {
 type Action =
   | { type: 'ADD_FILES';       paths: string[] }
   | { type: 'CLEAR_FILES' }
+  | { type: 'TOGGLE_FILE_SELECT'; path: string }
+  | { type: 'SELECT_ALL_FILES' }
+  | { type: 'SELECT_NONE_FILES' }
   | { type: 'LOAD_COMMENTS';   path: string; rows: CommentRow[] }
   | { type: 'FILE_STARTED';    path: string; total: number }
   | { type: 'FILE_DONE';       path: string; translated: number; untranslated: number; total: number; trans: Record<string, string> }
@@ -32,9 +35,14 @@ type Action =
   | { type: 'START_RUNNING' }
   | { type: 'ALL_DONE';        translated: number; errors: number }
   | { type: 'STATUS';          msg: string }
-  | { type: 'TRANSLATIONS_APPLIED' }
+  | { type: 'TRANSLATIONS_APPLIED'; paths: string[] }
 
 const basename = (p: string) => p.replace(/\\/g, '/').split('/').pop() ?? p
+const FILE_FILTERS: FileFilterOption[] = [
+  { key: 'cpp_src', label: 'C/C++ 源文件', extensions: ['.cpp', '.cxx', '.cc', '.c'] },
+  { key: 'cpp_header', label: 'C/C++ 头文件', extensions: ['.h', '.hpp', '.hxx', '.hh', '.inl', '.ipp'] },
+  { key: 'cmake', label: 'CMake', extensions: ['.cmake', 'CMakeLists.txt'] },
+]
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -42,11 +50,20 @@ function reducer(state: State, action: Action): State {
       const existing = new Set(state.files.map(f => f.path))
       const newFiles: FileEntry[] = action.paths
         .filter(p => !existing.has(p))
-        .map(p => ({ path: p, name: basename(p), status: 'pending', translated: 0, total: 0 }))
+        .map(p => ({ path: p, name: basename(p), status: 'pending', translated: 0, total: 0, selected: true }))
       return { ...state, files: [...state.files, ...newFiles] }
     }
     case 'CLEAR_FILES':
       return { ...state, files: [], comments: {}, commentsLoaded: {}, translations: {} }
+    case 'TOGGLE_FILE_SELECT':
+      return {
+        ...state,
+        files: state.files.map(f => f.path === action.path ? { ...f, selected: !f.selected } : f),
+      }
+    case 'SELECT_ALL_FILES':
+      return { ...state, files: state.files.map(f => ({ ...f, selected: true })) }
+    case 'SELECT_NONE_FILES':
+      return { ...state, files: state.files.map(f => ({ ...f, selected: false })) }
 
     case 'LOAD_COMMENTS':
       return {
@@ -141,7 +158,12 @@ function reducer(state: State, action: Action): State {
       return { ...state, statusMsg: action.msg }
 
     case 'TRANSLATIONS_APPLIED':
-      return { ...state, translations: {} }
+      return {
+        ...state,
+        translations: Object.fromEntries(
+          Object.entries(state.translations).filter(([path]) => !action.paths.includes(path))
+        ),
+      }
 
     default:
       return state
@@ -161,6 +183,7 @@ interface Props { settings: Settings }
 export default function FilePage({ settings }: Props) {
   const [state, dispatch] = useReducer(reducer, INIT)
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
+  const [activeFilters, setActiveFilters] = useState<string[]>(FILE_FILTERS.map(item => item.key))
   const wsRef = useRef<{ stop: () => void } | null>(null)
 
   const handleWsEvent = useCallback((evt: WsEvent) => {
@@ -213,11 +236,14 @@ export default function FilePage({ settings }: Props) {
 
   const handleAddPaths = useCallback(async (paths: string[]) => {
     dispatch({ type: 'STATUS', msg: '扫描文件…' })
-    const { files, errors } = await apiScan(paths)
+    const extensions = FILE_FILTERS
+      .filter(item => activeFilters.includes(item.key))
+      .flatMap(item => item.extensions)
+    const { files, errors } = await apiScan(paths, extensions)
     if (errors.length) console.warn('scan errors:', errors)
     dispatch({ type: 'ADD_FILES', paths: files })
     dispatch({ type: 'STATUS', msg: `已添加 ${files.length} 个文件` })
-  }, [])
+  }, [activeFilters])
 
   const handleSelectFile = useCallback(async (path: string) => {
     setSelectedFile(path)
@@ -261,22 +287,36 @@ export default function FilePage({ settings }: Props) {
   }, [])
 
   const handleApply = useCallback(async () => {
-    if (Object.keys(state.translations).length === 0) return
+    const selectedPaths = state.files
+      .filter(f => f.selected && state.translations[f.path] && Object.keys(state.translations[f.path]).length > 0)
+      .map(f => f.path)
+
+    if (selectedPaths.length === 0) return
+
+    const selectedTranslations = Object.fromEntries(
+      selectedPaths.map(path => [path, state.translations[path]])
+    )
+
     dispatch({ type: 'STATUS', msg: '写回文件…' })
-    const { applied, errors } = await apiApply(state.translations)
+    const { applied, errors } = await apiApply(selectedTranslations)
     if (errors.length) {
       dispatch({ type: 'STATUS', msg: `部分失败: ${errors.join('; ')}` })
     } else {
-      dispatch({ type: 'TRANSLATIONS_APPLIED' })
+      dispatch({ type: 'TRANSLATIONS_APPLIED', paths: applied })
       dispatch({ type: 'STATUS', msg: `✓ 已写回 ${applied.length} 个文件` })
     }
-  }, [state.translations])
+  }, [state.files, state.translations])
 
   const currentRows = selectedFile ? (state.comments[selectedFile] ?? null) : null
   const doneRows    = currentRows?.filter(r => r.status === 'done').length ?? 0
   const engRows     = currentRows?.filter(r => r.isEnglish).length ?? 0
-  const hasBlockingErrors = state.files.some(f => f.status === 'error' || (f.untranslated ?? 0) > 0)
-  const hasTranslations = Object.values(state.translations).some(t => Object.keys(t).length > 0)
+  const selectedFiles = state.files.filter(f => f.selected)
+  const hasBlockingErrors = selectedFiles.some(f => f.status === 'error' || (f.untranslated ?? 0) > 0)
+  const selectedApplyCount = selectedFiles.filter(f => {
+    const trans = state.translations[f.path]
+    return trans && Object.keys(trans).length > 0
+  }).length
+  const hasTranslations = selectedApplyCount > 0
 
   return (
     <div className="page-layout">
@@ -284,7 +324,20 @@ export default function FilePage({ settings }: Props) {
         <FilePanel
           files={state.files}
           selectedFile={selectedFile}
+          filters={FILE_FILTERS}
+          activeFilters={activeFilters}
+          onToggleFilter={key => {
+            setActiveFilters(current => {
+              if (current.includes(key)) {
+                return current.length > 1 ? current.filter(item => item !== key) : current
+              }
+              return [...current, key]
+            })
+          }}
           onSelect={handleSelectFile}
+          onToggleSelect={path => dispatch({ type: 'TOGGLE_FILE_SELECT', path })}
+          onSelectAll={() => dispatch({ type: 'SELECT_ALL_FILES' })}
+          onSelectNone={() => dispatch({ type: 'SELECT_NONE_FILES' })}
           onAddPaths={handleAddPaths}
           onClear={() => dispatch({ type: 'CLEAR_FILES' })}
         />
@@ -309,6 +362,7 @@ export default function FilePage({ settings }: Props) {
         files={state.files.length}
         doneFiles={state.doneFiles}
         totalTranslated={state.totalTranslated}
+        selectedApplyCount={selectedApplyCount}
         statusMsg={state.statusMsg}
         isRunning={state.isRunning}
         canApply={hasTranslations && !hasBlockingErrors && settings.outputMode !== 'inplace'}

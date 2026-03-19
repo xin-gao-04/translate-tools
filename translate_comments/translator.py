@@ -11,6 +11,7 @@ Ollama API reference: https://github.com/ollama/ollama/blob/main/docs/api.md
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Iterator
 
@@ -36,15 +37,70 @@ _SYSTEM_PROMPT = (
 )
 
 _USER_TEMPLATE = (
-    "Comment to translate:\n{text}\n\n"
-    "Use the surrounding source context only to disambiguate meaning. "
-    "Translate only the comment text itself.\n"
+    "Task: translate an English source-code comment into Simplified Chinese.\n"
+    "Return only the final Chinese translation.\n\n"
+    "Comment:\n{text}\n\n"
+    "Context for disambiguation only:\n"
     "{context_block}"
 )
 
 
 class TranslationError(RuntimeError):
     """Raised when Ollama returns an error or is unreachable."""
+
+
+_PROMPT_ECHO_PATTERNS = [
+    re.compile(r"^\s*task:\s*translate.*$", re.IGNORECASE),
+    re.compile(r"^\s*return only the final chinese translation\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*comment(?: to translate)?:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*context for disambiguation only:\s*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*use the surrounding source context only to disambiguate meaning\.?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*translate only the comment text itself\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*source context before:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*source context after:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*full comment block context:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*\(no extra context\)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*上下文仅用于区分[:：]?\s*$"),
+    re.compile(r"^\s*仅使用上下文辅助判断[:：]?\s*$"),
+    re.compile(r"^\s*仅翻译注释文本本身[:：]?\s*$"),
+    re.compile(r"^\s*源代码上下文.*[:：]?\s*$"),
+    re.compile(r"^\s*完整注释块上下文[:：]?\s*$"),
+    re.compile(r"^\s*无额外上下文\s*$"),
+]
+
+
+def sanitize_translation_output(content: str, original_text: str) -> str:
+    """Remove prompt-echo boilerplate from translation output."""
+    lines = content.splitlines()
+    cleaned: list[str] = []
+    skipping_context = False
+
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if stripped == original_text.strip():
+            continue
+
+        if any(pattern.match(stripped) for pattern in _PROMPT_ECHO_PATTERNS):
+            skipping_context = (
+                "context" in lower
+                or "上下文" in stripped
+            )
+            continue
+
+        if skipping_context:
+            if not stripped:
+                skipping_context = False
+            continue
+
+        cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+    return result or content.strip()
 
 
 class OllamaTranslator:
@@ -103,7 +159,8 @@ class OllamaTranslator:
             related_text=related_text,
         )
         response = self._post_with_retry("/api/chat", payload)
-        return self._parse_chat_response(response)
+        content = self._parse_chat_response(response)
+        return sanitize_translation_output(content, text)
 
     def translate_chunked(
         self,
@@ -215,6 +272,22 @@ class OllamaTranslator:
             return False, f"Cannot connect to Ollama at {self.host}."
         except Exception as exc:  # noqa: BLE001
             return False, f"Ollama check failed: {exc}"
+
+    def list_models(self) -> list[str]:
+        """Return model names available from the Ollama host."""
+        try:
+            resp = self._session.get(f"{self.host}/api/tags", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.ConnectionError as exc:
+            raise TranslationError(f"Cannot connect to Ollama at {self.host}.") from exc
+        except requests.RequestException as exc:
+            raise TranslationError(f"Failed to fetch models from Ollama: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise TranslationError(f"Invalid JSON from Ollama: {exc}") from exc
+
+        models = [m.get("name", "").strip() for m in data.get("models", [])]
+        return [name for name in models if name]
 
     # ------------------------------------------------------------------ #
     # Private helpers                                                      #

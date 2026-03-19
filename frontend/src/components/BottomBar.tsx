@@ -2,6 +2,7 @@ interface Props {
   files: number
   doneFiles: number
   totalTranslated: number
+  selectedApplyCount: number
   statusMsg: string
   isRunning: boolean
   canApply: boolean
@@ -12,6 +13,7 @@ interface Props {
 
 export default function BottomBar({
   files, doneFiles, totalTranslated,
+  selectedApplyCount,
   statusMsg, isRunning, canApply,
   onStart, onStop, onApply,
 }: Props) {
@@ -31,7 +33,7 @@ export default function BottomBar({
 
       {canApply && (
         <button className="btn btn-apply" onClick={onApply}>
-          💾 应用到文件
+          {`💾 写入所选文件 (${selectedApplyCount})`}
         </button>
       )}
 

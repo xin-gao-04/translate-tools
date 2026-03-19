@@ -84,4 +84,7 @@ class FileScanner:
                 results.append(entry)
 
     def _matches(self, path: Path) -> bool:
+        normalized = path.name.lower()
+        if normalized in self._extensions:
+            return True
         return path.suffix.lower().lstrip(".") in self._extensions

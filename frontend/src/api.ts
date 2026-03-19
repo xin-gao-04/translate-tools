@@ -23,17 +23,22 @@ export async function apiHealth(): Promise<boolean> {
   } catch { return false }
 }
 
-export async function apiScan(paths: string[]): Promise<{ files: string[]; errors: string[] }> {
+export async function apiScan(paths: string[], extensions?: string[]): Promise<{ files: string[]; errors: string[] }> {
   const r = await fetch(`${apiBase()}/api/scan`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ paths }),
+    body: JSON.stringify({ paths, ...(extensions ? { extensions } : {}) }),
   })
   return r.json()
 }
 
 export async function apiCheck(host: string, model: string): Promise<{ ok: boolean; message: string }> {
   const r = await fetch(`${apiBase()}/api/check?host=${encodeURIComponent(host)}&model=${encodeURIComponent(model)}`)
+  return r.json()
+}
+
+export async function apiModels(host: string): Promise<{ ok: boolean; models: string[]; message: string }> {
+  const r = await fetch(`${apiBase()}/api/models?host=${encodeURIComponent(host)}`)
   return r.json()
 }
 
