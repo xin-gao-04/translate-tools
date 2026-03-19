@@ -127,19 +127,21 @@ export default function HeaderPage({ settings }: Props) {
     setIsScanning(true)
     setStatusMsg('扫描头文件…')
     try {
-      const { files: scanned, errors } = await apiScan(paths)
-      const headerPaths = scanned.filter(path => HEADER_EXT_RE.test(path))
+      // Only scan for header/interface file extensions — avoids returning
+      // large numbers of .cpp files that we'd need to filter out anyway.
+      const HEADER_EXTENSIONS = ['.h', '.hpp', '.hxx', '.hh', '.inl', '.ipp']
+      const { files: scanned, errors } = await apiScan(paths, HEADER_EXTENSIONS)
       if (errors.length) {
         console.warn('header scan errors:', errors)
       }
-      if (headerPaths.length === 0) {
+      if (scanned.length === 0) {
         setStatusMsg('未找到 .h / .hpp / .inl / .ipp 头文件')
         return
       }
 
       setFiles(prev => {
         const existing = new Set(prev.map(entry => entry.path))
-        const added = headerPaths
+        const added = scanned
           .filter(path => !existing.has(path))
           .map(path => ({
             path,
@@ -151,10 +153,13 @@ export default function HeaderPage({ settings }: Props) {
         return [...prev, ...added]
       })
 
-      const firstPath = selectedFile ?? headerPaths[0]
-      setSelectedFile(firstPath)
-      await loadFile(firstPath)
-      setStatusMsg(`已载入 ${headerPaths.length} 个头文件`)
+      // Select and analyze the first newly-found file (or keep selection if already set)
+      const firstNew = scanned[0]
+      if (!selectedFile) {
+        setSelectedFile(firstNew)
+        await loadFile(firstNew)
+      }
+      setStatusMsg(`已载入 ${scanned.length} 个头文件`)
     } finally {
       setIsScanning(false)
     }
@@ -257,7 +262,7 @@ export default function HeaderPage({ settings }: Props) {
         targetSymbols.some(target => target.line_start === symbol.line_start)
           ? {
               ...symbol,
-              generate_status: 'idle',
+              generate_status: 'idle' as const,
               generated_comment: undefined,
               generate_partial: undefined,
             }
@@ -272,7 +277,7 @@ export default function HeaderPage({ settings }: Props) {
             ...prev,
             [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
               symbol.line_start === evt.line
-                ? { ...symbol, generate_status: 'running', generate_partial: '' }
+                ? { ...symbol, generate_status: 'running' as const, generate_partial: '' }
                 : symbol
             ),
           }))
@@ -283,7 +288,7 @@ export default function HeaderPage({ settings }: Props) {
             ...prev,
             [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
               symbol.line_start === evt.line
-                ? { ...symbol, generate_status: 'running', generate_partial: evt.partial }
+                ? { ...symbol, generate_status: 'running' as const, generate_partial: evt.partial }
                 : symbol
             ),
           }))
@@ -294,7 +299,7 @@ export default function HeaderPage({ settings }: Props) {
               symbol.line_start === evt.line
                 ? {
                     ...symbol,
-                    generate_status: 'done',
+                    generate_status: 'done' as const,
                     generated_comment: evt.comment,
                     generate_partial: undefined,
                   }

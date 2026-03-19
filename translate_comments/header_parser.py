@@ -1,10 +1,11 @@
 """Parse C++ headers and expose a unified symbol model.
 
 This module extracts declaration-level symbols from header-like files:
-functions, methods, constructors/destructors, and common variable/member
-declarations. The parser is intentionally heuristic, but it keeps line
-numbers stable and stays namespace/class aware so the UI can drive comment
-generation and diff preview reliably.
+functions, methods, constructors/destructors, operator overloads, and common
+variable/member declarations.
+
+The parser is heuristic, but uses proper parenthesis/angle-bracket balancing
+so it handles templated return types, std::function params, nested generics, etc.
 """
 
 from __future__ import annotations
@@ -49,30 +50,42 @@ class FunctionInfo:
     comment_line_end: int
 
 
-# ── Keywords that are definitely not symbol names ────────────────────────────
+# ── Keyword sets ──────────────────────────────────────────────────────────────
 
+# Words that can never be a function/variable name
 _CTRL_FLOW = frozenset({
     "if", "else", "while", "for", "do", "switch", "case", "default",
     "return", "break", "continue", "goto", "throw", "catch", "try",
-    "sizeof", "alignof", "decltype", "typeid", "new", "delete",
-    "static_assert", "assert", "class", "struct", "enum", "union",
-    "namespace", "typedef", "using", "template", "friend",
-    "operator", "auto",
+    "sizeof", "alignof", "decltype", "typeid",
+    "static_assert", "assert",
+    "class", "struct", "enum", "union",
+    "namespace", "typedef", "using", "template",
+    "auto",
 })
 
+# Lines whose *first identifier* definitely aren't function/variable declarations.
+# NOTE: 'operator' and 'friend' are intentionally NOT here:
+#   - 'operator' is the first word in conversion operators: `operator bool() const;`
+#   - 'friend' declarations can be valid and worth documenting
 _SKIP_FIRST_WORD = frozenset({
     "class", "struct", "enum", "union", "namespace", "typedef", "using",
-    "template", "friend", "return", "if", "else", "while", "for", "switch",
-    "case", "break", "continue", "goto", "throw", "catch", "#",
-    "public", "private", "protected", "signals", "slots",
+    "template",
+    "return", "if", "else", "while", "for", "switch",
+    "case", "break", "continue", "goto", "throw", "catch",
+    "#",
+    "public", "private", "protected",
+    "signals", "slots",      # Qt extensions
+    "Q_SIGNALS", "Q_SLOTS",  # Qt macros
 })
 
 
 # ── Source preprocessor ───────────────────────────────────────────────────────
 
 def _preprocess(source: str) -> list[str]:
-    """Return lines with comments and literal bodies masked by spaces."""
+    """Return lines with comment text and string literals masked by spaces.
 
+    Brace/paren characters are preserved so the caller can track nesting depth.
+    """
     out: list[str] = []
     line: list[str] = []
     i = 0
@@ -157,9 +170,10 @@ def _preprocess(source: str) -> list[str]:
 # ── Comment-before detector ───────────────────────────────────────────────────
 
 def _find_comment_before(orig_lines: list[str], line_idx: int) -> tuple[int, int, str]:
-    """Return the comment block immediately preceding *line_idx* if present."""
+    """Return (start, end, text) of the comment block immediately preceding line_idx."""
 
     i = line_idx - 1
+    # Allow one blank line between comment and declaration
     if i >= 0 and not orig_lines[i].strip():
         i -= 1
     if i < 0:
@@ -175,6 +189,7 @@ def _find_comment_before(orig_lines: list[str], line_idx: int) -> tuple[int, int
 
     if s.endswith("*/") or s.startswith("/*") or (s.startswith("*") and not s.startswith("*/")):
         end = i
+        # Walk forward to find */ if we're pointing at a middle line
         while end < line_idx - 1 and not orig_lines[end].strip().endswith("*/"):
             end += 1
         start = i
@@ -185,54 +200,140 @@ def _find_comment_before(orig_lines: list[str], line_idx: int) -> tuple[int, int
     return -1, -1, ""
 
 
-# ── Declaration regexes ───────────────────────────────────────────────────────
+# ── Balanced-paren helpers ────────────────────────────────────────────────────
 
-_QUALIFIERS = (
-    r"(?:(?:virtual|static|inline|explicit|constexpr|const|volatile|mutable|"
-    r"friend|override|final|noexcept|nodiscard|\[\[[\w:,\s]+\]\]|__\w+)\s+)*"
-)
+def _find_param_paren_pos(text: str) -> int:
+    """Return the index of the '(' that opens the function parameter list.
 
-_FUNC_RE = re.compile(
-    _QUALIFIERS
-    + r"(?:[\w:*&<>\s,\[\]]+?\s+)?"
-    + r"(?P<name>~?[A-Za-z_]\w*)\s*"
-    + r"\("
-    + r"[^)]*"
-    + r"\)"
-    + r"[^;{=]*"
-    + r"(?:;|\{|=\s*(?:0|default|delete)\s*;)",
-)
+    Skips over angle-bracket template expressions in the return type, e.g.:
+        std::vector<int> foo(...)   → returns index of the '(' after 'foo'
+        std::map<K,V> bar(...)      → returns index of '(' after 'bar'
 
-_VAR_RE = re.compile(
-    _QUALIFIERS
-    + r"(?:[\w:<>~,\[\]\s]+?)\s+"
-    + r"(?:[*&]\s*)*"
-    + r"(?P<name>[A-Za-z_]\w*)"
-    + r"\s*(?:\[[^\]]*\])?"
-    + r"\s*(?:=\s*[^;]+|\{[^;]*\})?\s*;",
-)
+    Also handles the conversion-operator edge case:
+        operator bool()             → returns index of '(' after 'bool'
+        operator()(int x)           → returns index of the *second* '('
+    """
+    angle = 0
+    paren_count = 0
+    i = 0
+    length = len(text)
 
-_CLASS_SCOPE_RE = re.compile(r"\s*(class|struct)\s+(\w+)[^;{]*(?:\{|$)")
-_NAMESPACE_SCOPE_RE = re.compile(r"\s*(?:inline\s+)?namespace(?:\s+([\w:]+))?[^;{]*(?:\{|$)")
+    while i < length:
+        ch = text[i]
+
+        if ch == '<':
+            # Only treat as angle bracket if it looks like a template argument.
+            # Heuristic: preceded by an identifier or '>'.
+            if i > 0 and (text[i - 1].isalnum() or text[i - 1] in (">", "_", ")")):
+                angle += 1
+        elif ch == '>':
+            if angle > 0:
+                angle -= 1
+        elif ch == '(':
+            if angle == 0:
+                paren_count += 1
+                if paren_count == 1:
+                    # Check special case: this '(' belongs to operator()
+                    before = text[:i].rstrip()
+                    if re.search(r'\boperator\s*$', before):
+                        # This is the '()' operator symbol itself.
+                        # The real parameter list starts AFTER the matching ')'.
+                        # Fast-forward past this operator() pair.
+                        j = i + 1
+                        while j < length and text[j] != ')':
+                            j += 1
+                        i = j + 1  # skip past ')'
+                        paren_count = 0
+                        continue
+                    return i
+        i += 1
+
+    return -1
 
 
-def _class_context(scope_stack: list[tuple[str, str, int]]) -> str:
-    for kind, name, _depth in reversed(scope_stack):
-        if kind in {"class", "struct"} and name:
-            return name
-    return ""
+def _extract_func_name(decl: str) -> str | None:
+    """Extract the function name from a complete C++ function declaration string.
+
+    Works by:
+      1. Verifying the declaration ends with ;, {, or = 0/default/delete ;
+      2. Finding the '(' that opens the parameter list (angle-bracket aware)
+      3. Looking backwards from that '(' for the function name
+
+    Handles:
+      - Normal functions / methods
+      - Constructors / destructors (~Name)
+      - Operator overloads (operator==, operator[], operator bool, etc.)
+      - Templated return types (std::vector<T>, std::function<void(int)>, etc.)
+    """
+    stripped = decl.strip()
+
+    # Must end with a declaration terminator
+    if not re.search(r'(?:;|\{|=\s*(?:0|default|delete)\s*;)\s*$', stripped):
+        return None
+
+    paren_pos = _find_param_paren_pos(stripped)
+    if paren_pos < 0:
+        return None
+
+    before = stripped[:paren_pos]
+
+    # ── Operator overloads ──────────────────────────────────────────────────
+    # Patterns: operator==, operator+, operator[], operator bool, operator new[]
+    op_m = re.search(
+        r'\boperator\s*'
+        r'('
+        r'(?:new|delete)(?:\s*\[\])?'    # new, delete, new[], delete[]
+        r'|<<=?|>>=?'                     # <<= >>= << >>
+        r'|[+\-*/%^&|~!<>=]=?'           # arithmetic/bitwise/compare with optional =
+        r'|&&|\|\|'                       # logical
+        r'|\[\]|\(\)'                     # subscript, call
+        r'|->|\+\+|--'                    # arrow, inc/dec
+        r'|,'                             # comma
+        r'|[A-Za-z_]\w*'                  # conversion: operator bool, operator int, etc.
+        r')'
+        r'\s*$',
+        before,
+    )
+    if op_m:
+        op_sym = op_m.group(1).strip()
+        # Conversion operators (operator bool, operator int, ...) need a space;
+        # symbol operators (operator==, operator+, ...) don't.
+        if op_sym and (op_sym[0].isalpha() or op_sym[0] == "_"):
+            return f"operator {op_sym}"
+        return f"operator{op_sym}"
+
+    # ── Conversion operator with no symbol before '(' ───────────────────────
+    # e.g. "operator bool" where "bool" is the type token
+    # Also handles plain "operator" if something weird
+    if re.search(r'\boperator\s*$', before):
+        return "operator()"
+
+    # ── Normal function / constructor / destructor ───────────────────────────
+    name_m = re.search(r'(~?[A-Za-z_]\w*)\s*$', before)
+    if not name_m:
+        return None
+
+    name = name_m.group(1)
+
+    # Filter out control-flow keywords
+    if name in _CTRL_FLOW:
+        return None
+
+    return name
 
 
-def _namespace_context(scope_stack: list[tuple[str, str, int]]) -> str:
-    names = [name for kind, name, _depth in scope_stack if kind == "namespace" and name]
-    return "::".join(names)
-
+# ── Multi-line declaration accumulators ───────────────────────────────────────
 
 def _accumulate_function(lines: list[str], start: int) -> tuple[str, int]:
+    """Join continuation lines until parentheses are balanced.
+
+    Returns (combined_text, last_line_index).
+    Limited to 30 continuation lines to avoid runaway.
+    """
     combined = lines[start]
     paren_depth = lines[start].count("(") - lines[start].count(")")
     j = start + 1
-    while paren_depth > 0 and j < len(lines) and j < start + 20:
+    while paren_depth > 0 and j < len(lines) and j < start + 30:
         nxt = lines[j]
         combined += " " + nxt.strip()
         paren_depth += nxt.count("(") - nxt.count(")")
@@ -242,6 +343,7 @@ def _accumulate_function(lines: list[str], start: int) -> tuple[str, int]:
 
 
 def _accumulate_statement(lines: list[str], start: int) -> tuple[str, int]:
+    """Join continuation lines until a semicolon is found."""
     combined = lines[start]
     j = start + 1
     while ";" not in combined and j < len(lines) and j < start + 20:
@@ -249,6 +351,23 @@ def _accumulate_statement(lines: list[str], start: int) -> tuple[str, int]:
         j += 1
     end = max(start, j - 1)
     return combined, end
+
+
+# ── Variable-statement classifier ─────────────────────────────────────────────
+
+_VAR_QUALIFIERS = (
+    r"(?:(?:static|const|volatile|mutable|constexpr|extern|inline|"
+    r"register|thread_local)\s+)*"
+)
+
+_VAR_RE = re.compile(
+    _VAR_QUALIFIERS
+    + r"(?:[\w:<>~,\[\]\s]+?)\s+"
+    + r"(?:[*&]\s*)*"
+    + r"(?P<name>[A-Za-z_]\w*)"
+    + r"\s*(?:\[[^\]]*\])?"
+    + r"\s*(?:=\s*[^;]+|\{[^;]*\})?\s*;",
+)
 
 
 def _looks_like_variable_statement(statement: str) -> bool:
@@ -267,6 +386,26 @@ def _looks_like_variable_statement(statement: str) -> bool:
         return False
     return True
 
+
+# ── Scope tracking ────────────────────────────────────────────────────────────
+
+_CLASS_SCOPE_RE = re.compile(r"\s*(class|struct)\s+(\w+)[^;{]*(?:\{|$)")
+_NAMESPACE_SCOPE_RE = re.compile(r"\s*(?:inline\s+)?namespace(?:\s+([\w:]+))?[^;{]*(?:\{|$)")
+
+
+def _class_context(scope_stack: list[tuple[str, str, int]]) -> str:
+    for kind, name, _depth in reversed(scope_stack):
+        if kind in {"class", "struct"} and name:
+            return name
+    return ""
+
+
+def _namespace_context(scope_stack: list[tuple[str, str, int]]) -> str:
+    names = [name for kind, name, _depth in scope_stack if kind == "namespace" and name]
+    return "::".join(names)
+
+
+# ── Symbol factory ────────────────────────────────────────────────────────────
 
 def _make_symbol(
     *,
@@ -295,13 +434,14 @@ def _make_symbol(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:
+def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:  # noqa: C901
     """Extract declaration-level symbols from C++ header/source text."""
 
     orig_lines = source.splitlines()
     proc_lines = _preprocess(source)
 
     results: list[HeaderSymbolInfo] = []
+    # scope_stack entries: (kind, name, entry_brace_depth)
     scope_stack: list[tuple[str, str, int]] = []
     brace_depth = 0
     pending_scope: tuple[str, str] | None = None
@@ -311,40 +451,55 @@ def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:
     while i < len(proc_lines):
         raw = proc_lines[i]
         stripped = raw.strip()
-        line_start_depth = brace_depth
 
+        # ── Step 1: unconditional brace accounting ────────────────────────────
         opens = raw.count("{")
         closes = raw.count("}")
-        opened_scopes: list[tuple[str, str, int]] = []
+        line_start_depth = brace_depth  # depth BEFORE this line's braces
 
-        class_m = _CLASS_SCOPE_RE.match(raw)
-        namespace_m = _NAMESPACE_SCOPE_RE.match(raw)
-        if class_m:
-            kind, name = class_m.group(1), class_m.group(2)
-            if "{" in raw:
-                opened_scopes.append((kind, name, line_start_depth + 1))
-            else:
-                pending_scope = (kind, name)
-        elif namespace_m:
-            name = namespace_m.group(1) or ""
-            if "{" in raw:
-                opened_scopes.append(("namespace", name, line_start_depth + 1))
-            else:
-                pending_scope = ("namespace", name)
-        elif opens > 0 and pending_scope is not None:
-            opened_scopes.append((pending_scope[0], pending_scope[1], line_start_depth + 1))
+        # Flush pending scope opened by a '{' on this line
+        new_scopes: list[tuple[str, str, int]] = []
+        if opens > 0 and pending_scope is not None:
+            new_scopes.append((pending_scope[0], pending_scope[1], brace_depth + 1))
             pending_scope = None
 
-        brace_depth = line_start_depth + opens - closes
-        scope_stack.extend(opened_scopes)
+        brace_depth += opens - closes
+
+        scope_stack.extend(new_scopes)
+        # Pop scopes whose closing brace was on this line
         while scope_stack and brace_depth < scope_stack[-1][2]:
             scope_stack.pop()
 
-        if class_m or namespace_m:
+        # ── Step 2: detect class/struct/namespace scope openers ───────────────
+        class_m = _CLASS_SCOPE_RE.match(raw)
+        namespace_m = _NAMESPACE_SCOPE_RE.match(raw)
+
+        if class_m:
+            kind, name = class_m.group(1), class_m.group(2)
+            if "{" in raw:
+                # Entry depth = depth after the '{' on this line
+                scope_stack.append((kind, name, line_start_depth + 1))
+            else:
+                pending_scope = (kind, name)
             i += 1
             continue
 
+        if namespace_m:
+            name = namespace_m.group(1) or ""
+            if "{" in raw:
+                scope_stack.append(("namespace", name, line_start_depth + 1))
+            else:
+                pending_scope = ("namespace", name)
+            i += 1
+            continue
+
+        # ── Step 3: quick skip ────────────────────────────────────────────────
         if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+
+        # Skip access specifiers and similar labels
+        if re.match(r'^\s*(public|private|protected|signals|slots)\s*:', raw):
             i += 1
             continue
 
@@ -354,35 +509,35 @@ def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:
             i += 1
             continue
 
-        # Only examine declaration-depth lines. Using line_start_depth avoids
-        # skipping declarations that themselves open braces (e.g. inline defs or
-        # brace initialisers) before we have a chance to classify them.
+        # ── Step 4: skip lines inside function/method bodies ──────────────────
+        # line_start_depth > len(scope_stack) means we are inside a body that
+        # is not a class/namespace scope (i.e., a function body).
         if line_start_depth > len(scope_stack):
             i += 1
             continue
 
         decl_start = i
 
+        # ── Step 5: function / method / constructor / destructor ──────────────
         if "(" in raw:
             combined, decl_end = _accumulate_function(proc_lines, i)
-            m_func = _FUNC_RE.search(combined)
-            if m_func:
-                func_name = m_func.group("name")
-                if func_name not in _CTRL_FLOW and decl_start not in seen_lines:
-                    seen_lines.add(decl_start)
-                    results.append(
-                        _make_symbol(
-                            kind="function",
-                            name=func_name,
-                            decl_start=decl_start,
-                            decl_end=decl_end,
-                            orig_lines=orig_lines,
-                            scope_stack=scope_stack,
-                        )
+            func_name = _extract_func_name(combined)
+            if func_name and func_name not in _CTRL_FLOW and decl_start not in seen_lines:
+                seen_lines.add(decl_start)
+                results.append(
+                    _make_symbol(
+                        kind="function",
+                        name=func_name,
+                        decl_start=decl_start,
+                        decl_end=decl_end,
+                        orig_lines=orig_lines,
+                        scope_stack=scope_stack,
                     )
-                    i = decl_end + 1
-                    continue
+                )
+                i = decl_end + 1
+                continue
 
+        # ── Step 6: member variable / constant ───────────────────────────────
         if ";" not in raw and i + 1 < len(proc_lines):
             combined_stmt, decl_end = _accumulate_statement(proc_lines, i)
         else:
@@ -409,7 +564,7 @@ def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:
 
         i += 1
 
-    results.sort(key=lambda symbol: (symbol.line_start, symbol.kind, symbol.name))
+    results.sort(key=lambda s: (s.line_start, s.kind, s.name))
     return results
 
 

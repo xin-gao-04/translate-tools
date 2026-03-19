@@ -107,46 +107,58 @@ function reducer(state: State, action: Action): State {
         files: state.files.map(f => f.path === action.path ? { ...f, status: 'error' } : f),
       }
 
-    case 'COMMENT_RUNNING':
+    case 'COMMENT_RUNNING': {
+      // Guard: if file hasn't been loaded yet, don't create a spurious empty array.
+      // COMMENT_RUNNING/CHUNK/DONE events can arrive before the user ever clicks
+      // the file; ?? [] would set comments[path] = [] (an empty array), which is
+      // truthy and would cause the table to render empty instead of null.
+      if (!(action.path in state.comments)) return state
       return {
         ...state,
         comments: {
           ...state.comments,
-          [action.path]: (state.comments[action.path] ?? []).map(r =>
+          [action.path]: state.comments[action.path].map(r =>
             r.lineno === action.lineno ? { ...r, status: 'running', chunkTotal: action.chunkTotal, translated: '' } : r
           ),
         },
       }
-    case 'COMMENT_CHUNK':
+    }
+    case 'COMMENT_CHUNK': {
+      if (!(action.path in state.comments)) return state
       return {
         ...state,
         comments: {
           ...state.comments,
-          [action.path]: (state.comments[action.path] ?? []).map(r =>
+          [action.path]: state.comments[action.path].map(r =>
             r.lineno === action.lineno ? { ...r, translated: action.partial } : r
           ),
         },
       }
-    case 'COMMENT_DONE':
+    }
+    case 'COMMENT_DONE': {
+      if (!(action.path in state.comments)) return state
       return {
         ...state,
         comments: {
           ...state.comments,
-          [action.path]: (state.comments[action.path] ?? []).map(r =>
+          [action.path]: state.comments[action.path].map(r =>
             r.lineno === action.lineno ? { ...r, status: 'done', translated: action.translated } : r
           ),
         },
       }
-    case 'COMMENT_FAILED':
+    }
+    case 'COMMENT_FAILED': {
+      if (!(action.path in state.comments)) return state
       return {
         ...state,
         comments: {
           ...state.comments,
-          [action.path]: (state.comments[action.path] ?? []).map(r =>
+          [action.path]: state.comments[action.path].map(r =>
             r.lineno === action.lineno ? { ...r, status: 'error', translated: action.message } : r
           ),
         },
       }
+    }
 
     case 'START_RUNNING':
       return { ...state, isRunning: true, doneFiles: 0, totalTranslated: 0 }
