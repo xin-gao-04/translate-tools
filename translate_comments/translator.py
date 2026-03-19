@@ -34,7 +34,7 @@ import requests
 
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5:7b"  # good Chinese↔English model available on Ollama
-REQUEST_TIMEOUT = 120  # seconds
+REQUEST_TIMEOUT = 60   # seconds — per HTTP request; retried up to max_retries times
 
 # Comments shorter than this skip context_before/after in the prompt (saves
 # ~100-200 prompt tokens for comments that don't benefit from context).
@@ -218,8 +218,9 @@ class OllamaTranslator:
         JSON-structured output, reducing HTTP round-trips from N to ≈N÷batch_size.
 
         The cache is checked before sending and updated after each batch.
-        Falls back to individual :meth:`translate` calls if the LLM response
-        cannot be parsed as a valid JSON array of the expected length.
+        If the batched LLM call fails (bad JSON / wrong count), falls back to
+        individual :meth:`translate` calls — which raise :exc:`TranslationError`
+        on failure so the caller can emit proper error events.
 
         Parameters
         ----------
@@ -232,8 +233,12 @@ class OllamaTranslator:
         Returns
         -------
         list[str]
-            Translated strings in the same order as *texts*.  Items that fail
-            are returned as the original text (never raises).
+            Translated strings in the same order as *texts*.
+
+        Raises
+        ------
+        TranslationError
+            If any individual translation fails during the fallback path.
         """
         if not texts:
             return []
@@ -255,13 +260,19 @@ class OllamaTranslator:
             batch_texts = [texts[i] for i in batch_idx]
 
             if len(batch_texts) == 1:
-                # Single item: use standard translate (gets streaming + context)
-                results[batch_idx[0]] = self._translate_safe(batch_texts[0])
+                # Single item: use standard translate (raises on failure)
+                result = self.translate(batch_texts[0])
+                results[batch_idx[0]] = result
                 if self.enable_cache:
-                    self._cache[batch_texts[0].strip()] = results[batch_idx[0]]
+                    self._cache[batch_texts[0].strip()] = result
                 continue
 
-            translated = self._translate_batch_llm(batch_texts)
+            try:
+                translated = self._translate_batch_llm(batch_texts)
+            except TranslationError:
+                # Batch call failed — fall back to individual calls (these raise)
+                translated = [self.translate(t) for t in batch_texts]
+
             for list_pos, original_idx in enumerate(batch_idx):
                 result = translated[list_pos]
                 results[original_idx] = result
@@ -447,27 +458,30 @@ class OllamaTranslator:
             },
         }
 
+        response = self._post_with_retry("/api/chat", payload)
+        content  = self._parse_chat_response(response)
+
         try:
-            response = self._post_with_retry("/api/chat", payload)
-            content = self._parse_chat_response(response)
             parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise TranslationError(
+                f"Batch: invalid JSON from Ollama ({exc}): {content[:120]!r}"
+            ) from exc
 
-            # Direct array
-            if isinstance(parsed, list) and len(parsed) == n:
-                return [str(item).strip() for item in parsed]
+        # Direct array
+        if isinstance(parsed, list) and len(parsed) == n:
+            return [str(item).strip() for item in parsed]
 
-            # Wrapped: {"translations": [...], "results": [...], ...}
-            if isinstance(parsed, dict):
-                for key in ("translations", "results", "output", "comments", "data"):
-                    arr = parsed.get(key)
-                    if isinstance(arr, list) and len(arr) == n:
-                        return [str(item).strip() for item in arr]
+        # Wrapped: {"translations": [...], "results": [...], ...}
+        if isinstance(parsed, dict):
+            for key in ("translations", "results", "output", "comments", "data"):
+                arr = parsed.get(key)
+                if isinstance(arr, list) and len(arr) == n:
+                    return [str(item).strip() for item in arr]
 
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Fallback: translate individually
-        return [self._translate_safe(t) for t in texts]
+        raise TranslationError(
+            f"Batch: expected JSON array of {n} items, got: {content[:120]!r}"
+        )
 
     def _build_payload(
         self,

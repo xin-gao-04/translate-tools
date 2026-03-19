@@ -422,6 +422,22 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
             ]
             long_comments = [c for c in english if c not in short_comments]
 
+            # Per-call asyncio timeout: prevents a single stuck Ollama request
+            # from blocking all subsequent comments/files.
+            CALL_TIMEOUT = 90   # seconds per batch or individual translate call
+
+            async def _run_in_executor(fn):
+                """Run *fn()* in a thread pool with a per-call asyncio timeout."""
+                try:
+                    return await asyncio.wait_for(
+                        loop.run_in_executor(None, fn),
+                        timeout=CALL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TranslationError(
+                        f"翻译超时（>{CALL_TIMEOUT}s），跳过本条"
+                    ) from exc
+
             # ── Batch short comments ───────────────────────────────────────────
             BATCH_SIZE = 6
             for batch_start in range(0, len(short_comments), BATCH_SIZE):
@@ -438,9 +454,8 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
 
                 batch_texts = [c.text for c in batch]
                 try:
-                    batch_results = await loop.run_in_executor(
-                        None,
-                        lambda texts=batch_texts: translator.translate_batch(texts),
+                    batch_results = await _run_in_executor(
+                        lambda texts=batch_texts: translator.translate_batch(texts)
                     )
 
                     for c, result in zip(batch, batch_results):
@@ -454,7 +469,7 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         file_translated  += 1
                         total_translated += 1
 
-                except Exception as exc:  # noqa: BLE001
+                except (TranslationError, Exception) as exc:  # noqa: BLE001
                     for c in batch:
                         file_untranslated += 1
                         await ws.send_json({
@@ -465,10 +480,11 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         })
                     await ws.send_json({
                         "type": "log",
-                        "message": f"批量翻译失败 ({path.name}): {exc}",
+                        "message": f"批量翻译失败 ({path.name} L{batch[0].line_start}–L{batch[-1].line_start}): {exc}",
                     })
 
             # ── Long comments: chunk + stream individually ─────────────────────
+            from translate_comments.splitter import join_translations
             for c in long_comments:
                 context_before, context_after = _context_for(c)
                 chunks = split_for_translation(c.text, max_chars=req.chunk_threshold)
@@ -484,13 +500,11 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 try:
                     if len(chunks) > 1:
                         translated_parts: list[str] = []
-                        from translate_comments.splitter import join_translations
                         for idx, chunk in enumerate(chunks):
-                            part = await loop.run_in_executor(
-                                None,
+                            part = await _run_in_executor(
                                 lambda ch=chunk, before=context_before, after=context_after, full=c.text:
                                     translator.translate(ch, context_before=before,
-                                                         context_after=after, related_text=full),
+                                                         context_after=after, related_text=full)
                             )
                             translated_parts.append(part)
                             partial_text = join_translations(translated_parts, c.text)
@@ -504,11 +518,10 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                             })
                         result = join_translations(translated_parts, c.text)
                     else:
-                        result = await loop.run_in_executor(
-                            None,
+                        result = await _run_in_executor(
                             lambda text=c.text, before=context_before, after=context_after:
                                 translator.translate(text, context_before=before,
-                                                     context_after=after),
+                                                     context_after=after)
                         )
 
                     translations[c.line_start] = result
@@ -521,7 +534,7 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                     file_translated  += 1
                     total_translated += 1
 
-                except TranslationError as exc:
+                except (TranslationError, Exception) as exc:  # noqa: BLE001
                     file_untranslated += 1
                     await ws.send_json({
                         "type": "comment_failed",
@@ -547,9 +560,8 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 total_errors += 1
                 await ws.send_json({
                     "type": "log",
-                    "message": f"{path.name} 有 {file_untranslated} 条注释未翻译，已停止后续文件处理。",
+                    "message": f"{path.name} 有 {file_untranslated} 条注释未能翻译，继续处理后续文件。",
                 })
-                break
 
         # Emit cache stats as a log hint
         stats = translator.cache_stats()
