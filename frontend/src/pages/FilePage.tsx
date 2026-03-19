@@ -1,4 +1,4 @@
-import { useCallback, useReducer, useRef, useState } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import type { CommentRow, FileEntry, FileFilterOption, Settings, WsEvent } from '../types'
 import { apiApply, apiComments, apiScan, startTranslation } from '../api'
 import FilePanel from '../components/FilePanel'
@@ -198,6 +198,11 @@ export default function FilePage({ settings }: Props) {
   const [activeFilters, setActiveFilters] = useState<string[]>(FILE_FILTERS.map(item => item.key))
   const wsRef = useRef<{ stop: () => void } | null>(null)
 
+  // Keep a stable ref to settings so handleWsEvent can read it without
+  // needing to be recreated every time settings change.
+  const settingsRef = useRef(settings)
+  useEffect(() => { settingsRef.current = settings }, [settings])
+
   const handleWsEvent = useCallback((evt: WsEvent) => {
     switch (evt.type) {
       case 'file_started':
@@ -218,16 +223,34 @@ export default function FilePage({ settings }: Props) {
         dispatch({ type: 'COMMENT_FAILED', path: evt.path, lineno: evt.lineno, message: evt.message })
         dispatch({ type: 'STATUS', msg: `未翻译: ${basename(evt.path)} L${evt.lineno} — ${evt.message}` })
         break
-      case 'file_done':
+      case 'file_done': {
+        const trans = evt.translations ?? {}
         dispatch({
           type: 'FILE_DONE',
           path: evt.path,
           translated: evt.translated,
           untranslated: evt.untranslated,
           total: evt.translated + evt.untranslated,
-          trans: evt.translations ?? {},
+          trans,
         })
+        // In inplace mode, auto-write translations to disk immediately
+        if (
+          settingsRef.current.outputMode === 'inplace' &&
+          evt.untranslated === 0 &&
+          Object.keys(trans).length > 0
+        ) {
+          dispatch({ type: 'STATUS', msg: `写回文件: ${basename(evt.path)}…` })
+          apiApply({ [evt.path]: trans }).then(({ applied, errors }) => {
+            if (errors.length) {
+              dispatch({ type: 'STATUS', msg: `写回失败: ${errors.join(', ')}` })
+            } else if (applied.length) {
+              dispatch({ type: 'TRANSLATIONS_APPLIED', paths: applied })
+              dispatch({ type: 'STATUS', msg: `✓ 已写回: ${basename(evt.path)}` })
+            }
+          })
+        }
         break
+      }
       case 'file_error':
         dispatch({ type: 'FILE_ERROR', path: evt.path, message: evt.message })
         dispatch({ type: 'STATUS', msg: `错误: ${basename(evt.path)}: ${evt.message}` })

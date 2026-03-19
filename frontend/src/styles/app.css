@@ -660,12 +660,28 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
 
 .header-main-toolbar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
+  flex-direction: column;
+  gap: 8px;
   padding: 10px 12px;
   background: #F8FAFC;
   border-bottom: 1px solid var(--border-lite);
+}
+
+/* Row 1: checkboxes + text inputs */
+.header-toolbar-config-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Row 2: action buttons — always a single line, never hidden */
+.header-toolbar-actions-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
 }
 
 .header-toolbar-group {

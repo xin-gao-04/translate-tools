@@ -458,83 +458,85 @@ export default function HeaderPage({ settings }: Props) {
 
         <div className="header-main">
           <div className="header-main-toolbar">
-            <div className="header-toolbar-group">
-              <label className="hdr-check">
+            <div className="header-toolbar-config-row">
+              <div className="header-toolbar-group">
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={config.replaceExisting}
+                    onChange={e => updateConfig({ replaceExisting: e.target.checked })}
+                  />
+                  <span>替换已有注释</span>
+                </label>
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={config.includeBrief}
+                    onChange={e => updateConfig({ includeBrief: e.target.checked })}
+                  />
+                  <span>@brief</span>
+                </label>
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={config.includeParams}
+                    onChange={e => updateConfig({ includeParams: e.target.checked })}
+                  />
+                  <span>@param</span>
+                </label>
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={config.includeReturn}
+                    onChange={e => updateConfig({ includeReturn: e.target.checked })}
+                  />
+                  <span>@return</span>
+                </label>
+              </div>
+
+              <div className="header-toolbar-group header-toolbar-inputs">
                 <input
-                  type="checkbox"
-                  checked={config.replaceExisting}
-                  onChange={e => updateConfig({ replaceExisting: e.target.checked })}
+                  className="header-config-input"
+                  value={config.author}
+                  onChange={e => updateConfig({ author: e.target.value })}
+                  placeholder="作者标签（可选）"
                 />
-                <span>替换已有注释</span>
-              </label>
-              <label className="hdr-check">
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={config.includeDate}
+                    onChange={e => updateConfig({ includeDate: e.target.checked })}
+                  />
+                  <span>附带日期</span>
+                </label>
                 <input
-                  type="checkbox"
-                  checked={config.includeBrief}
-                  onChange={e => updateConfig({ includeBrief: e.target.checked })}
+                  className="header-config-input header-config-input-small"
+                  value={config.dateFormat}
+                  onChange={e => updateConfig({ dateFormat: e.target.value })}
+                  placeholder="%Y-%m-%d"
                 />
-                <span>@brief</span>
-              </label>
-              <label className="hdr-check">
                 <input
-                  type="checkbox"
-                  checked={config.includeParams}
-                  onChange={e => updateConfig({ includeParams: e.target.checked })}
+                  className="header-config-input"
+                  value={config.customTags.map(tag => tag.value ? `${tag.name}:${tag.value}` : tag.name).join(', ')}
+                  onChange={e => {
+                    const tags = e.target.value
+                      .split(',')
+                      .map(part => part.trim())
+                      .filter(Boolean)
+                      .map(part => {
+                        const idx = part.indexOf(':')
+                        return idx >= 0
+                          ? { name: part.slice(0, idx).trim(), value: part.slice(idx + 1).trim() }
+                          : { name: part, value: '' }
+                      })
+                    updateConfig({ customTags: tags })
+                  }}
+                  placeholder="自定义标签，例：since:v2, owner:core"
                 />
-                <span>@param</span>
-              </label>
-              <label className="hdr-check">
-                <input
-                  type="checkbox"
-                  checked={config.includeReturn}
-                  onChange={e => updateConfig({ includeReturn: e.target.checked })}
-                />
-                <span>@return</span>
-              </label>
+              </div>
             </div>
 
-            <div className="header-toolbar-group header-toolbar-inputs">
-              <input
-                className="header-config-input"
-                value={config.author}
-                onChange={e => updateConfig({ author: e.target.value })}
-                placeholder="作者标签（可选）"
-              />
-              <label className="hdr-check">
-                <input
-                  type="checkbox"
-                  checked={config.includeDate}
-                  onChange={e => updateConfig({ includeDate: e.target.checked })}
-                />
-                <span>附带日期</span>
-              </label>
-              <input
-                className="header-config-input header-config-input-small"
-                value={config.dateFormat}
-                onChange={e => updateConfig({ dateFormat: e.target.value })}
-                placeholder="%Y-%m-%d"
-              />
-              <input
-                className="header-config-input"
-                value={config.customTags.map(tag => tag.value ? `${tag.name}:${tag.value}` : tag.name).join(', ')}
-                onChange={e => {
-                  const tags = e.target.value
-                    .split(',')
-                    .map(part => part.trim())
-                    .filter(Boolean)
-                    .map(part => {
-                      const idx = part.indexOf(':')
-                      return idx >= 0
-                        ? { name: part.slice(0, idx).trim(), value: part.slice(idx + 1).trim() }
-                        : { name: part, value: '' }
-                    })
-                  updateConfig({ customTags: tags })
-                }}
-                placeholder="自定义标签，例：since:v2, owner:core"
-              />
-            </div>
-
-            <div className="header-toolbar-group">
+            <div className="header-toolbar-actions-row">
               <button className="btn btn-ghost" onClick={selectAll} disabled={!selectedFile || currentSymbols.length === 0}>
                 全选
               </button>
