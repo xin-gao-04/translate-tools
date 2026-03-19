@@ -5,6 +5,18 @@ translation.  The client is intentionally thin — it owns only the HTTP
 interaction and prompt construction; all orchestration lives in
 ``processor.py``.
 
+Performance features
+--------------------
+* **Session-level translation cache**: identical comment text is translated
+  once per run; subsequent occurrences return the cached result instantly.
+* **Adaptive token limit**: ``num_predict`` is sized to ~3.5× input tokens
+  rather than a fixed 512, so short comments finish faster.
+* **Context trimming**: ``context_before/after`` is omitted for very short
+  comments (< 60 chars) where it adds prompt overhead without helping quality.
+* **Batch LLM translation**: :meth:`translate_batch` groups multiple short
+  comments into a single Ollama call with JSON-structured output, reducing
+  HTTP round-trips from N to N÷batch_size.
+
 Ollama API reference: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
 
@@ -24,6 +36,13 @@ DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5:7b"  # good Chinese↔English model available on Ollama
 REQUEST_TIMEOUT = 120  # seconds
 
+# Comments shorter than this skip context_before/after in the prompt (saves
+# ~100-200 prompt tokens for comments that don't benefit from context).
+_SHORT_COMMENT_THRESHOLD = 60   # chars
+
+# Default batch size for translate_batch()
+_DEFAULT_BATCH_SIZE = 6
+
 # ── System / user prompt templates ───────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
@@ -42,6 +61,13 @@ _USER_TEMPLATE = (
     "Comment:\n{text}\n\n"
     "Context for disambiguation only:\n"
     "{context_block}"
+)
+
+_BATCH_SYSTEM_PROMPT = (
+    "You are a precise technical translator. "
+    "Translate source-code comments from English to Simplified Chinese. "
+    "Rules: preserve technical terms, variable names, and code identifiers as-is. "
+    "Output ONLY valid JSON — no other text."
 )
 
 
@@ -118,6 +144,9 @@ class OllamaTranslator:
         Number of times to retry on connection error.
     retry_delay:
         Seconds to wait between retries.
+    enable_cache:
+        If True (default), identical comment texts are translated once and
+        the result reused for subsequent occurrences in the same run.
     """
 
     def __init__(
@@ -127,13 +156,17 @@ class OllamaTranslator:
         timeout: int = REQUEST_TIMEOUT,
         max_retries: int = 3,
         retry_delay: float = 2.0,
+        enable_cache: bool = True,
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.enable_cache = enable_cache
         self._session = requests.Session()
+        # Session-level cache: normalised_text → translated_text
+        self._cache: dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # Public interface                                                     #
@@ -149,18 +182,93 @@ class OllamaTranslator:
     ) -> str:
         """Translate a single *text* string and return the Chinese result.
 
-        Raises ``TranslationError`` on failure.
+        Results are cached by normalised text so repeated occurrences within
+        a run are free.  Raises ``TranslationError`` on failure.
         """
+        cache_key = text.strip()
+        if self.enable_cache and cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # Short comments don't benefit from context — omit to save tokens
+        use_context = len(cache_key) >= _SHORT_COMMENT_THRESHOLD
         payload = self._build_payload(
             text,
             stream=False,
-            context_before=context_before,
-            context_after=context_after,
-            related_text=related_text,
+            context_before=context_before if use_context else "",
+            context_after=context_after if use_context else "",
+            related_text=related_text if use_context else "",
         )
         response = self._post_with_retry("/api/chat", payload)
         content = self._parse_chat_response(response)
-        return sanitize_translation_output(content, text)
+        result = sanitize_translation_output(content, text)
+
+        if self.enable_cache:
+            self._cache[cache_key] = result
+        return result
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        *,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> list[str]:
+        """Translate a list of short texts using batched LLM calls.
+
+        Groups up to *batch_size* texts into a single Ollama request with
+        JSON-structured output, reducing HTTP round-trips from N to ≈N÷batch_size.
+
+        The cache is checked before sending and updated after each batch.
+        Falls back to individual :meth:`translate` calls if the LLM response
+        cannot be parsed as a valid JSON array of the expected length.
+
+        Parameters
+        ----------
+        texts:
+            List of comment strings to translate (in order).
+        batch_size:
+            Maximum number of texts per LLM call.  Tune downward for models
+            that have trouble with long structured outputs.
+
+        Returns
+        -------
+        list[str]
+            Translated strings in the same order as *texts*.  Items that fail
+            are returned as the original text (never raises).
+        """
+        if not texts:
+            return []
+
+        results: list[str] = [""] * len(texts)
+        pending_indices: list[int] = []
+
+        # Fill cache hits first
+        for idx, text in enumerate(texts):
+            key = text.strip()
+            if self.enable_cache and key in self._cache:
+                results[idx] = self._cache[key]
+            else:
+                pending_indices.append(idx)
+
+        # Process pending in batches
+        for batch_start in range(0, len(pending_indices), batch_size):
+            batch_idx = pending_indices[batch_start : batch_start + batch_size]
+            batch_texts = [texts[i] for i in batch_idx]
+
+            if len(batch_texts) == 1:
+                # Single item: use standard translate (gets streaming + context)
+                results[batch_idx[0]] = self._translate_safe(batch_texts[0])
+                if self.enable_cache:
+                    self._cache[batch_texts[0].strip()] = results[batch_idx[0]]
+                continue
+
+            translated = self._translate_batch_llm(batch_texts)
+            for list_pos, original_idx in enumerate(batch_idx):
+                result = translated[list_pos]
+                results[original_idx] = result
+                if self.enable_cache:
+                    self._cache[texts[original_idx].strip()] = result
+
+        return results
 
     def translate_chunked(
         self,
@@ -203,18 +311,15 @@ class OllamaTranslator:
 
         return join_translations(translated_chunks, text)
 
-    def translate_batch(self, texts: list[str]) -> list[str]:
-        """Translate a list of texts sequentially and return results in order.
+    def translate_batch_sequential(self, texts: list[str]) -> list[str]:
+        """Translate a list of texts sequentially (no batching).
 
-        Failed translations are replaced with the original text so the
-        process does not abort mid-file.
+        Failed translations are replaced with the original text.
+        Prefer :meth:`translate_batch` for better performance.
         """
         results: list[str] = []
         for text in texts:
-            try:
-                results.append(self.translate(text))
-            except TranslationError:
-                results.append(text)  # fall back to original
+            results.append(self._translate_safe(text))
         return results
 
     def generate(
@@ -289,9 +394,80 @@ class OllamaTranslator:
         models = [m.get("name", "").strip() for m in data.get("models", [])]
         return [name for name in models if name]
 
+    def cache_stats(self) -> dict[str, int]:
+        """Return current cache statistics."""
+        return {"cached_entries": len(self._cache)}
+
+    def clear_cache(self) -> None:
+        """Clear the in-memory translation cache."""
+        self._cache.clear()
+
     # ------------------------------------------------------------------ #
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
+
+    def _translate_safe(self, text: str) -> str:
+        """Translate *text*, returning original on failure (never raises)."""
+        try:
+            return self.translate(text)
+        except TranslationError:
+            return text
+
+    def _translate_batch_llm(self, texts: list[str]) -> list[str]:
+        """Send *texts* as a single batched JSON request to Ollama.
+
+        Returns a list of translations in the same order.  Falls back to
+        individual translation for each item on any parse error.
+        """
+        n = len(texts)
+        texts_json = json.dumps(texts, ensure_ascii=False)
+
+        # Estimate output tokens: each input word → ~2 Chinese chars + overhead
+        total_input_chars = sum(len(t) for t in texts)
+        estimated_tokens = max(64, min(2048, int(total_input_chars * 3)))
+
+        prompt = (
+            f"Translate these {n} English source-code comments to Simplified Chinese.\n"
+            f"Return ONLY a JSON array of exactly {n} translated strings, "
+            f"in the same order as the input. No extra text.\n\n"
+            f"Input: {texts_json}"
+        )
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            "options": {
+                "temperature": 0.1,
+                "num_predict": estimated_tokens,
+            },
+        }
+
+        try:
+            response = self._post_with_retry("/api/chat", payload)
+            content = self._parse_chat_response(response)
+            parsed = json.loads(content)
+
+            # Direct array
+            if isinstance(parsed, list) and len(parsed) == n:
+                return [str(item).strip() for item in parsed]
+
+            # Wrapped: {"translations": [...], "results": [...], ...}
+            if isinstance(parsed, dict):
+                for key in ("translations", "results", "output", "comments", "data"):
+                    arr = parsed.get(key)
+                    if isinstance(arr, list) and len(arr) == n:
+                        return [str(item).strip() for item in arr]
+
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Fallback: translate individually
+        return [self._translate_safe(t) for t in texts]
 
     def _build_payload(
         self,
@@ -312,6 +488,12 @@ class OllamaTranslator:
         context_block = "\n\n".join(context_parts).strip()
         if not context_block:
             context_block = "(no extra context)"
+
+        # Adaptive token limit: size to ~3.5× estimated input tokens so short
+        # comments don't burn time generating a 512-token budget they won't use.
+        word_count = max(1, len(text.split()))
+        num_predict = max(32, min(512, int(word_count * 3.5)))
+
         return {
             "model": self.model,
             "stream": stream,
@@ -327,7 +509,7 @@ class OllamaTranslator:
             ],
             "options": {
                 "temperature": 0.1,   # low temperature → deterministic translation
-                "num_predict": 512,
+                "num_predict": num_predict,
             },
         }
 

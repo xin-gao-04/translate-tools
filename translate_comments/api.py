@@ -303,6 +303,18 @@ async def apply(req: ApplyRequest) -> dict:
 async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
     """Stream translation events.
 
+    Performance strategy
+    --------------------
+    * Phase 1 – pre-parse: all files are read and their English comments are
+      extracted concurrently (I/O ‖ CPU) before any LLM call starts.  This
+      lets the UI show accurate totals instantly and overlaps disk I/O with
+      later GPU work.
+    * Phase 2 – translate: within each file, short comments (≤ chunk_threshold
+      chars) are grouped into batches of up to 6 and sent to Ollama in a single
+      JSON-formatted request; long comments are still chunked individually with
+      streaming.  A session-level cache (inside OllamaTranslator) short-circuits
+      repeated comment texts across files.
+
     Client sends one JSON message:
         {"paths": [...], "host": "...", "model": "...", "chunk_threshold": 120}
 
@@ -326,46 +338,59 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
         await ws.close()
         return
 
-    loop   = asyncio.get_event_loop()
-    send   = lambda evt: asyncio.run_coroutine_threadsafe(ws.send_json(evt), loop)
+    loop       = asyncio.get_event_loop()
+    translator = OllamaTranslator(host=req.host, model=req.model, enable_cache=True)
 
-    translator     = OllamaTranslator(host=req.host, model=req.model)
     total_translated = 0
-    total_errors   = 0
-    all_translations: dict[str, dict[str, str]] = {}  # for apply-later
+    total_errors     = 0
+
+    # ── Phase 1: pre-parse all files concurrently ─────────────────────────────
+    # Read source, select parser, extract comments. This overlaps disk I/O
+    # across all files so the UI gets accurate totals before translation starts.
+
+    async def _prepare_file(path_str: str):
+        """Return (source_lines, english_comments, total_count) or (error_msg,)."""
+        path = Path(path_str)
+        try:
+            source = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: path.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError as exc:
+            return (str(exc),)
+        parser = get_parser_for_path(path_str)
+        if not parser:
+            return (f"No parser for {path.name}",)
+        all_comments = parser.extract_comments(source)
+        english = [c for c in all_comments if is_english(c.text)]
+        return source.splitlines(), english, len(all_comments)
+
+    prepared = await asyncio.gather(*[_prepare_file(p) for p in req.paths])
+
+    # Emit file_started for every file now that we know comment counts
+    for path_str, prep in zip(req.paths, prepared):
+        if len(prep) == 1:
+            # Error tuple
+            await ws.send_json({"type": "file_error", "path": path_str, "message": prep[0]})
+            total_errors += 1
+            continue
+        source_lines, english, total_count = prep
+        await ws.send_json({
+            "type": "file_started",
+            "path": path_str,
+            "english_count": len(english),
+            "total_comments": total_count,
+        })
+
+    # ── Phase 2: translate file by file ───────────────────────────────────────
 
     try:
-        for path_str in req.paths:
+        for path_str, prep in zip(req.paths, prepared):
+            if len(prep) == 1:
+                continue  # already emitted file_error above
+
+            source_lines, english, total_count = prep
             path = Path(path_str)
-
-            try:
-                source = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                await ws.send_json({"type": "file_error", "path": path_str, "message": str(exc)})
-                total_errors += 1
-                continue
-
-            source_lines = source.splitlines()
-
-            parser = get_parser_for_path(path_str)
-            if not parser:
-                await ws.send_json({
-                    "type": "file_error", "path": path_str,
-                    "message": f"No parser for {path.name}",
-                })
-                total_errors += 1
-                continue
-
-            all_comments = parser.extract_comments(source)
-            english      = [c for c in all_comments if is_english(c.text)]
-            skipped      = len(all_comments) - len(english)
-
-            await ws.send_json({
-                "type": "file_started",
-                "path": path_str,
-                "english_count": len(english),
-                "total_comments": len(all_comments),
-            })
+            skipped = total_count - len(english)
 
             if not english:
                 await ws.send_json({
@@ -376,23 +401,77 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 continue
 
             translations: dict[int, str] = {}
-            file_translated = 0
+            file_translated   = 0
             file_untranslated = 0
 
-            def _context_for(comment) -> tuple[str, str]:
+            def _context_for(comment, src_lines=source_lines) -> tuple[str, str]:
                 before_start = max(0, comment.line_start - 4)
-                before_end = max(0, comment.line_start - 1)
-                after_start = min(len(source_lines), comment.line_end)
-                after_end = min(len(source_lines), comment.line_end + 3)
-                before = "\n".join(source_lines[before_start:before_end])
-                after = "\n".join(source_lines[after_start:after_end])
-                return before, after
+                before_end   = max(0, comment.line_start - 1)
+                after_start  = min(len(src_lines), comment.line_end)
+                after_end    = min(len(src_lines), comment.line_end + 3)
+                return (
+                    "\n".join(src_lines[before_start:before_end]),
+                    "\n".join(src_lines[after_start:after_end]),
+                )
 
-            for c in english:
+            # Separate into short (batchable) and long (needs chunking)
+            short_comments = [
+                c for c in english
+                if len(c.text) <= req.chunk_threshold
+                and len(split_for_translation(c.text, max_chars=req.chunk_threshold)) <= 1
+            ]
+            long_comments = [c for c in english if c not in short_comments]
+
+            # ── Batch short comments ───────────────────────────────────────────
+            BATCH_SIZE = 6
+            for batch_start in range(0, len(short_comments), BATCH_SIZE):
+                batch = short_comments[batch_start : batch_start + BATCH_SIZE]
+
+                # Emit comment_started for each item in this batch
+                for c in batch:
+                    await ws.send_json({
+                        "type": "comment_started",
+                        "path": path_str,
+                        "lineno": c.line_start,
+                        "chunk_total": 1,
+                    })
+
+                batch_texts = [c.text for c in batch]
+                try:
+                    batch_results = await loop.run_in_executor(
+                        None,
+                        lambda texts=batch_texts: translator.translate_batch(texts),
+                    )
+
+                    for c, result in zip(batch, batch_results):
+                        translations[c.line_start] = result
+                        await ws.send_json({
+                            "type": "comment_done",
+                            "path": path_str,
+                            "lineno": c.line_start,
+                            "translated": result,
+                        })
+                        file_translated  += 1
+                        total_translated += 1
+
+                except Exception as exc:  # noqa: BLE001
+                    for c in batch:
+                        file_untranslated += 1
+                        await ws.send_json({
+                            "type": "comment_failed",
+                            "path": path_str,
+                            "lineno": c.line_start,
+                            "message": str(exc),
+                        })
+                    await ws.send_json({
+                        "type": "log",
+                        "message": f"批量翻译失败 ({path.name}): {exc}",
+                    })
+
+            # ── Long comments: chunk + stream individually ─────────────────────
+            for c in long_comments:
                 context_before, context_after = _context_for(c)
                 chunks = split_for_translation(c.text, max_chars=req.chunk_threshold)
-                if len(chunks) <= 1:
-                    chunks = []
                 chunk_total = max(len(chunks), 1)
 
                 await ws.send_json({
@@ -403,45 +482,33 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 })
 
                 try:
-                    if chunks:
-                        # Chunked translation with partial streaming
-                        async def _chunked(c=c, chunks=chunks):
-                            translated_parts: list[str] = []
-                            from translate_comments.splitter import join_translations
-                            for idx, chunk in enumerate(chunks):
-                                part = await loop.run_in_executor(
-                                    None,
-                                    lambda chunk=chunk, before=context_before, after=context_after, full_text=c.text:
-                                    translator.translate(
-                                        chunk,
-                                        context_before=before,
-                                        context_after=after,
-                                        related_text=full_text,
-                                    ),
-                                )
-                                translated_parts.append(part)
-                                partial = join_translations(translated_parts, c.text)
-                                await ws.send_json({
-                                    "type": "comment_chunk",
-                                    "path": path_str,
-                                    "lineno": c.line_start,
-                                    "partial": partial,
-                                    "chunk_idx": idx,
-                                    "chunk_total": len(chunks),
-                                })
-                            from translate_comments.splitter import join_translations
-                            return join_translations(translated_parts, c.text)
-
-                        result = await _chunked()
+                    if len(chunks) > 1:
+                        translated_parts: list[str] = []
+                        from translate_comments.splitter import join_translations
+                        for idx, chunk in enumerate(chunks):
+                            part = await loop.run_in_executor(
+                                None,
+                                lambda ch=chunk, before=context_before, after=context_after, full=c.text:
+                                    translator.translate(ch, context_before=before,
+                                                         context_after=after, related_text=full),
+                            )
+                            translated_parts.append(part)
+                            partial_text = join_translations(translated_parts, c.text)
+                            await ws.send_json({
+                                "type": "comment_chunk",
+                                "path": path_str,
+                                "lineno": c.line_start,
+                                "partial": partial_text,
+                                "chunk_idx": idx,
+                                "chunk_total": len(chunks),
+                            })
+                        result = join_translations(translated_parts, c.text)
                     else:
                         result = await loop.run_in_executor(
                             None,
                             lambda text=c.text, before=context_before, after=context_after:
-                            translator.translate(
-                                text,
-                                context_before=before,
-                                context_after=after,
-                            ),
+                                translator.translate(text, context_before=before,
+                                                     context_after=after),
                         )
 
                     translations[c.line_start] = result
@@ -467,8 +534,6 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         "message": f"翻译失败 L{c.line_start} ({path.name}): {exc}",
                     })
 
-            all_translations[path_str] = {str(k): v for k, v in translations.items()}
-
             await ws.send_json({
                 "type": "file_done",
                 "path": path_str,
@@ -485,6 +550,14 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                     "message": f"{path.name} 有 {file_untranslated} 条注释未翻译，已停止后续文件处理。",
                 })
                 break
+
+        # Emit cache stats as a log hint
+        stats = translator.cache_stats()
+        if stats["cached_entries"] > 0:
+            await ws.send_json({
+                "type": "log",
+                "message": f"缓存命中: 本次运行共缓存 {stats['cached_entries']} 条不同注释翻译",
+            })
 
         await ws.send_json({
             "type": "all_done",
