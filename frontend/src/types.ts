@@ -47,6 +47,8 @@ export interface HeaderTag {
   value: string
 }
 
+export type CommentLanguage = 'zh' | 'en'
+
 export interface HeaderConfig {
   replaceExisting: boolean
   includeBrief: boolean
@@ -56,6 +58,7 @@ export interface HeaderConfig {
   includeDate: boolean
   dateFormat: string
   customTags: HeaderTag[]
+  language: CommentLanguage
 }
 
 export type HeaderWsEvent =

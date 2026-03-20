@@ -214,6 +214,7 @@ export function startHeaderGeneration(
       include_date: config.includeDate,
       date_format: config.dateFormat,
       custom_tags: config.customTags,
+      language: config.language ?? 'zh',
     }))
   }
 

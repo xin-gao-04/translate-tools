@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
-import type { HeaderConfig, HeaderSymbol, HeaderWsEvent, Settings } from '../types'
+import type { CommentLanguage, HeaderConfig, HeaderSymbol, HeaderWsEvent, Settings } from '../types'
 import {
   apiAnalyzeHeader,
   apiApplyComments,
@@ -7,6 +7,7 @@ import {
   apiScan,
   startHeaderGeneration,
 } from '../api'
+import Resizer from '../components/Resizer'
 
 interface Props { settings: Settings }
 
@@ -37,6 +38,7 @@ const DEFAULT_CONFIG: HeaderConfig = {
   includeDate: false,
   dateFormat: '%Y-%m-%d',
   customTags: [],
+  language: 'zh',
 }
 
 const basename = (p: string) => p.replace(/\\/g, '/').split('/').pop() ?? p
@@ -54,7 +56,10 @@ export default function HeaderPage({ settings }: Props) {
   const [config, setConfig] = useState<HeaderConfig>(DEFAULT_CONFIG)
   const wsRef = useRef<{ stop: () => void } | null>(null)
   const dragCounter = useRef(0)
+  const mainBodyRef = useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(230)
+  const [symbolPaneFlex, setSymbolPaneFlex] = useState(1.2)
 
   const updateFileEntry = useCallback((path: string, updater: (entry: HeaderFileEntry) => HeaderFileEntry) => {
     setFiles(prev => {
@@ -395,6 +400,7 @@ export default function HeaderPage({ settings }: Props) {
       <div className="header-workspace">
         <div
           className="sidebar"
+          style={{ width: sidebarWidth, minWidth: 160, maxWidth: 400 }}
           onDragEnter={e => { e.preventDefault(); dragCounter.current++; setDragging(true) }}
           onDragLeave={() => { dragCounter.current--; if (dragCounter.current === 0) setDragging(false) }}
           onDragOver={e => e.preventDefault()}
@@ -456,6 +462,8 @@ export default function HeaderPage({ settings }: Props) {
           </div>
         </div>
 
+        <Resizer direction="horizontal" onResize={delta => setSidebarWidth(w => Math.max(160, Math.min(400, w + delta)))} />
+
         <div className="header-main">
           <div className="header-main-toolbar">
             <div className="header-toolbar-config-row">
@@ -495,6 +503,15 @@ export default function HeaderPage({ settings }: Props) {
               </div>
 
               <div className="header-toolbar-group header-toolbar-inputs">
+                <select
+                  className="header-config-input"
+                  style={{ minWidth: 100, maxWidth: 130 }}
+                  value={config.language}
+                  onChange={e => updateConfig({ language: e.target.value as CommentLanguage })}
+                >
+                  <option value="zh">中文注释</option>
+                  <option value="en">English</option>
+                </select>
                 <input
                   className="header-config-input"
                   value={config.author}
@@ -570,8 +587,8 @@ export default function HeaderPage({ settings }: Props) {
             </div>
           </div>
 
-          <div className="header-main-body">
-            <div className="header-symbol-list">
+          <div className="header-main-body" ref={mainBodyRef}>
+            <div className="header-symbol-list" style={{ flex: symbolPaneFlex }}>
               <div className="content-header">
                 {selectedFile ?? '— 左侧导入头文件并选择一个文件开始 —'}
               </div>
@@ -588,16 +605,27 @@ export default function HeaderPage({ settings }: Props) {
                 </div>
               )}
 
-              {currentSymbols.map(symbol => (
-                <SymbolCard
-                  key={`${symbol.kind}-${symbol.line_start}`}
-                  symbol={symbol}
-                  expanded={expandedLine === symbol.line_start}
-                  onToggleExpand={() => setExpandedLine(prev => prev === symbol.line_start ? null : symbol.line_start)}
-                  onToggleSelect={() => toggleSelect(symbol.line_start)}
-                />
-              ))}
+              <div className="header-symbol-scroll">
+                {currentSymbols.map(symbol => (
+                  <SymbolCard
+                    key={`${symbol.kind}-${symbol.line_start}`}
+                    symbol={symbol}
+                    expanded={expandedLine === symbol.line_start}
+                    onToggleExpand={() => setExpandedLine(prev => prev === symbol.line_start ? null : symbol.line_start)}
+                    onToggleSelect={() => toggleSelect(symbol.line_start)}
+                  />
+                ))}
+              </div>
             </div>
+
+            <Resizer direction="horizontal" onResize={delta => {
+              const body = mainBodyRef.current
+              if (!body) return
+              const totalW = body.clientWidth
+              if (totalW <= 0) return
+              const ratio = delta / totalW
+              setSymbolPaneFlex(f => Math.max(0.3, Math.min(3, f + ratio * (f + 1))))
+            }} />
 
             <div className="header-preview-pane">
               <div className="content-header">

@@ -255,7 +255,7 @@ def _extract_func_name(decl: str) -> str | None:
     """Extract the function name from a complete C++ function declaration string.
 
     Works by:
-      1. Verifying the declaration ends with ;, {, or = 0/default/delete ;
+      1. Verifying the declaration ends with ;, {, }, or = 0/default/delete ;
       2. Finding the '(' that opens the parameter list (angle-bracket aware)
       3. Looking backwards from that '(' for the function name
 
@@ -264,11 +264,17 @@ def _extract_func_name(decl: str) -> str | None:
       - Constructors / destructors (~Name)
       - Operator overloads (operator==, operator[], operator bool, etc.)
       - Templated return types (std::vector<T>, std::function<void(int)>, etc.)
+      - Inline single-line bodies: void foo() { return; }
+      - Bodies on next line: accumulate until { found externally
     """
     stripped = decl.strip()
 
-    # Must end with a declaration terminator
-    if not re.search(r'(?:;|\{|=\s*(?:0|default|delete)\s*;)\s*$', stripped):
+    # Must end with a declaration terminator:
+    #   ;            – forward declaration
+    #   {            – opening of a (possibly multi-line) function body
+    #   }            – closing of a single-line inline body, e.g. void f() { return; }
+    #   = 0/default/delete ;  – pure-virtual / defaulted / deleted
+    if not re.search(r'(?:;|\{|\}|=\s*(?:0|default|delete)\s*;)\s*$', stripped):
         return None
 
     paren_pos = _find_param_paren_pos(stripped)
@@ -522,6 +528,28 @@ def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:  # noqa: C901
         if "(" in raw:
             combined, decl_end = _accumulate_function(proc_lines, i)
             func_name = _extract_func_name(combined)
+
+            # Look-ahead: handle the common pattern where the opening '{' (or
+            # trailing qualifiers like 'const override') appears on subsequent
+            # lines.  We extend the combined text line-by-line until the
+            # terminator regex in _extract_func_name matches.  We do NOT
+            # advance decl_end so that the main loop still processes those
+            # lines normally and keeps brace_depth accurate.
+            if func_name is None and "(" in combined:
+                lookahead = combined
+                for _la_j in range(decl_end + 1, min(decl_end + 8, len(proc_lines))):
+                    la_stripped = proc_lines[_la_j].strip()
+                    if not la_stripped or la_stripped.startswith("#"):
+                        break
+                    lookahead += " " + la_stripped
+                    _candidate = _extract_func_name(lookahead)
+                    if _candidate is not None:
+                        func_name = _candidate
+                        break
+                    # Stop scanning once we clearly entered a body/new statement
+                    if la_stripped in ("{", "}") or ";" in la_stripped:
+                        break
+
             if func_name and func_name not in _CTRL_FLOW and decl_start not in seen_lines:
                 seen_lines.add(decl_start)
                 results.append(

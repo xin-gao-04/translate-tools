@@ -8,6 +8,7 @@
     "build": "vite build",
     "electron:dev": "electron electron/main.cjs --dev",
     "electron:build": "vite build && electron-builder",
+    "electron:build:portable": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows-portable.ps1",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -27,6 +28,9 @@
   "build": {
     "appId": "com.translate-comments.gui",
     "productName": "translate-comments",
+    "directories": {
+      "output": "../release"
+    },
     "files": ["dist/**", "electron/**"],
     "extraResources": [
       { "from": "../", "to": "backend",

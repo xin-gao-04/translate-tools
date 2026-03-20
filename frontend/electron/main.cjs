@@ -9,6 +9,7 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog } = require('electron')
+const fs = require('fs')
 const path = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
@@ -21,30 +22,55 @@ let backendProcess = null
 
 // ── Start Python backend ──────────────────────────────────────────────────────
 
+function resolvePythonLauncher () {
+  const configured = process.env.TRANSLATE_COMMENTS_PYTHON?.trim()
+  if (configured) {
+    return { command: configured, prefixArgs: [] }
+  }
+
+  if (!isDev) {
+    const bundledCandidates = [
+      path.join(process.resourcesPath, 'backend-runtime', 'python.exe'),
+      path.join(process.resourcesPath, 'backend-runtime', 'Scripts', 'python.exe'),
+    ]
+
+    for (const candidate of bundledCandidates) {
+      if (fs.existsSync(candidate)) {
+        return { command: candidate, prefixArgs: [] }
+      }
+    }
+  }
+
+  if (process.platform === 'win32') {
+    return { command: 'py', prefixArgs: ['-3'] }
+  }
+
+  return { command: 'python3', prefixArgs: [] }
+}
+
 function startBackend () {
-  const pythonCmd = isDev
-    ? ['-m', 'translate_comments.api', '--port', String(API_PORT)]
-    : null  // TODO: point to PyInstaller bundle in production
-
-  if (!pythonCmd) return   // production bundling handled separately
-
-  const exe = process.platform === 'win32' ? 'python' : 'python3'
+  const pythonCmd = ['-m', 'translate_comments.api', '--port', String(API_PORT)]
+  const launcher = resolvePythonLauncher()
 
   // In dev, run from the project root (one level up from frontend/)
   const cwd = isDev
     ? path.join(__dirname, '..', '..')  // translate-tool/
     : path.join(process.resourcesPath, 'backend')
 
-  backendProcess = spawn(exe, pythonCmd, {
+  backendProcess = spawn(launcher.command, [...launcher.prefixArgs, ...pythonCmd], {
     cwd,
     env: {
       ...process.env,
       PYTHONUNBUFFERED: '1',
+      PYTHONPATH: [cwd, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     },
   })
 
   backendProcess.stdout.on('data', d => process.stdout.write(`[backend] ${d}`))
   backendProcess.stderr.on('data', d => process.stderr.write(`[backend] ${d}`))
+  backendProcess.on('error', err => {
+    console.error(`[backend] failed to start: ${err.message}`)
+  })
   backendProcess.on('exit', code => {
     if (code !== 0 && code !== null)
       console.error(`[backend] exited with code ${code}`)

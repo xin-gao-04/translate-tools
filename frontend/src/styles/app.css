@@ -114,6 +114,7 @@ html, body, #root { height: 100%; overflow: hidden; }
   text-transform: uppercase;
   color: #3D5870;
   user-select: none;
+  flex-shrink: 0;
 }
 
 .filter-panel {
@@ -213,6 +214,7 @@ html, body, #root { height: 100%; overflow: hidden; }
   display: flex;
   gap: 6px;
   padding: 8px;
+  flex-shrink: 0;
 }
 
 /* ── Content panel ── */
@@ -655,6 +657,7 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
   flex: 1;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   background: var(--surface);
 }
 
@@ -665,6 +668,7 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
   padding: 10px 12px;
   background: #F8FAFC;
   border-bottom: 1px solid var(--border-lite);
+  flex-shrink: 0;
 }
 
 /* Row 1: checkboxes + text inputs */
@@ -786,7 +790,14 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
   height: 100%;
 }
 
+/* Symbol list: fixed header + scrollable card area */
 .header-symbol-list {
+  overflow: hidden;
+}
+
+.header-symbol-scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 8px;
   display: flex;
@@ -801,6 +812,7 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
   border-radius: 7px;
   overflow: hidden;
   transition: box-shadow .1s;
+  flex-shrink: 0;
 }
 .func-card:hover { box-shadow: 0 1px 4px rgba(0,0,0,.08); }
 .func-card.expanded { border-color: var(--accent); }
@@ -891,6 +903,27 @@ table.comment-table tr:hover td { background: #EFF6FF !important; }
 .func-code.existing  { color: #94A3B8; }
 .func-code.generated { color: #79C0FF; border: 1px solid #1C3A55; }
 .func-code.implementation { color: #F8FAFC; border: 1px solid #1E293B; }
+
+/* ── Resizer handles ── */
+.resizer {
+  flex-shrink: 0;
+  background: transparent;
+  transition: background .15s;
+  z-index: 10;
+}
+.resizer:hover, .resizer:active {
+  background: var(--accent);
+}
+
+.resizer-horizontal {
+  width: 4px;
+  cursor: col-resize;
+}
+
+.resizer-vertical {
+  height: 4px;
+  cursor: row-resize;
+}
 
 @media (max-width: 1100px) {
   .header-main-body {

@@ -6,7 +6,8 @@ $venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $venvScripts = Join-Path $repoRoot '.venv\Scripts'
 $viteCmd = Join-Path $frontendDir 'node_modules\.bin\vite.cmd'
 $electronExe = Join-Path $frontendDir 'node_modules\electron\dist\electron.exe'
-$viteLog = Join-Path $frontendDir 'vite-dev.log'
+$viteStdOutLog = Join-Path $frontendDir 'vite-dev.log'
+$viteStdErrLog = Join-Path $frontendDir 'vite-dev.err.log'
 $startedVite = $false
 
 function Test-HttpReady {
@@ -55,15 +56,15 @@ if (Test-HttpReady -Url 'http://127.0.0.1:5173' -Retries 2 -DelayMs 200) {
 } else {
     $viteProcess = Start-Process -FilePath $viteCmd `
         -WorkingDirectory $frontendDir `
-        -RedirectStandardOutput $viteLog `
-        -RedirectStandardError $viteLog `
+        -RedirectStandardOutput $viteStdOutLog `
+        -RedirectStandardError $viteStdErrLog `
         -PassThru
     $startedVite = $true
 }
 
 try {
     if (-not (Test-HttpReady -Url 'http://127.0.0.1:5173')) {
-        throw "Vite did not become ready in time. Check log: $viteLog"
+        throw "Vite did not become ready in time. Check logs: $viteStdOutLog, $viteStdErrLog"
     }
 
     if (Test-HttpReady -Url 'http://127.0.0.1:8765/api/health' -Retries 2 -DelayMs 200) {

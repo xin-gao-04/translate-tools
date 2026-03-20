@@ -210,8 +210,30 @@ class CppParser(BaseParser):
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_block_text(text: str) -> str:
+    """Remove nested comment delimiters that would break C/C++ compilation."""
+    # Strip wrapping /* */ or /** */ if the LLM echoed them back
+    s = text.strip()
+    if s.startswith("/**"):
+        s = s[3:]
+    elif s.startswith("/*"):
+        s = s[2:]
+    if s.endswith("*/"):
+        s = s[:-2]
+    # Replace any stray */ inside the text to avoid premature close
+    s = s.replace("*/", "* /")
+    return s.strip()
+
+
 def _rewrap(comment: Comment, text: str) -> str:
     if comment.style == "line":
+        # For inline comments (col_start > 0, same line as code), keep
+        # everything on a SINGLE line to avoid breaking the code line.
+        is_inline = comment.col_start > 0 and comment.line_start == comment.line_end
+        if is_inline:
+            single = " ".join(text.replace("\n", " ").split())
+            return f"// {single}" if single else "//"
+
         indent = " " * max(comment.col_start, 0)
         lines = _fit_line_comment_lines(comment, text)
         first = f"// {lines[0]}" if lines[0] else "//"
@@ -222,6 +244,7 @@ def _rewrap(comment: Comment, text: str) -> str:
         return "\n".join([first, *rest])
 
     # Block / doc — rebuild with per-line " * " prefix when multiline
+    text = _sanitize_block_text(text)
     lines = text.splitlines()
     if len(lines) <= 1:
         single = text.replace("\n", " ")

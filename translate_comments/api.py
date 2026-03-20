@@ -110,6 +110,7 @@ class GenerateCommentsRequest(BaseModel):
     include_date: bool = False
     date_format: str = "%Y-%m-%d"
     custom_tags: list[HeaderTagRequest] = []
+    language: str = "zh"
 
 
 class ApplyCommentsRequest(BaseModel):
@@ -426,22 +427,26 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
             # from blocking all subsequent comments/files.
             CALL_TIMEOUT = 90   # seconds per batch or individual translate call
 
-            async def _run_in_executor(fn):
+            async def _run_in_executor(fn, timeout=CALL_TIMEOUT):
                 """Run *fn()* in a thread pool with a per-call asyncio timeout."""
                 try:
                     return await asyncio.wait_for(
                         loop.run_in_executor(None, fn),
-                        timeout=CALL_TIMEOUT,
+                        timeout=timeout,
                     )
                 except asyncio.TimeoutError as exc:
                     raise TranslationError(
-                        f"翻译超时（>{CALL_TIMEOUT}s），跳过本条"
+                        f"翻译超时（>{timeout}s），跳过本条"
                     ) from exc
 
-            # ── Batch short comments ───────────────────────────────────────────
-            BATCH_SIZE = 6
-            for batch_start in range(0, len(short_comments), BATCH_SIZE):
-                batch = short_comments[batch_start : batch_start + BATCH_SIZE]
+            # ── Adaptive batch short comments ─────────────────────────────────
+            # Start at batch_size=6; on timeout or batch failure, halve it
+            # (6→3→1). Once at 1 we stay sequential for the rest of this file.
+            batch_size = 6
+            sc_idx = 0
+
+            while sc_idx < len(short_comments):
+                batch = short_comments[sc_idx : sc_idx + batch_size]
 
                 # Emit comment_started for each item in this batch
                 for c in batch:
@@ -454,9 +459,16 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
 
                 batch_texts = [c.text for c in batch]
                 try:
-                    batch_results = await _run_in_executor(
-                        lambda texts=batch_texts: translator.translate_batch(texts)
-                    )
+                    if batch_size == 1:
+                        # Single-comment mode: translate individually
+                        result = await _run_in_executor(
+                            lambda text=batch_texts[0]: translator.translate(text)
+                        )
+                        batch_results = [result]
+                    else:
+                        batch_results = await _run_in_executor(
+                            lambda texts=batch_texts: translator.translate_batch(texts)
+                        )
 
                     for c, result in zip(batch, batch_results):
                         translations[c.line_start] = result
@@ -469,7 +481,22 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         file_translated  += 1
                         total_translated += 1
 
+                    sc_idx += len(batch)
+
                 except (TranslationError, Exception) as exc:  # noqa: BLE001
+                    old_size = batch_size
+
+                    if batch_size > 1:
+                        # Reduce batch size and retry the SAME batch
+                        batch_size = max(1, batch_size // 2)
+                        await ws.send_json({
+                            "type": "log",
+                            "message": f"批量翻译失败（batch {old_size}→{batch_size}）: {exc}",
+                        })
+                        # Don't advance sc_idx — retry with smaller batch
+                        continue
+
+                    # Already at batch_size=1: mark as failed and move on
                     for c in batch:
                         file_untranslated += 1
                         await ws.send_json({
@@ -480,8 +507,9 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         })
                     await ws.send_json({
                         "type": "log",
-                        "message": f"批量翻译失败 ({path.name} L{batch[0].line_start}–L{batch[-1].line_start}): {exc}",
+                        "message": f"翻译失败 ({path.name} L{batch[0].line_start}): {exc}",
                     })
+                    sc_idx += len(batch)
 
             # ── Long comments: chunk + stream individually ─────────────────────
             from translate_comments.splitter import join_translations
@@ -489,6 +517,10 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                 context_before, context_after = _context_for(c)
                 chunks = split_for_translation(c.text, max_chars=req.chunk_threshold)
                 chunk_total = max(len(chunks), 1)
+
+                # Adaptive timeout: scale with comment length
+                # Base 90s + 30s per 500 chars beyond 500, capped at 300s
+                long_timeout = min(300, CALL_TIMEOUT + max(0, len(c.text) - 500) // 500 * 30)
 
                 await ws.send_json({
                     "type": "comment_started",
@@ -504,7 +536,8 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                             part = await _run_in_executor(
                                 lambda ch=chunk, before=context_before, after=context_after, full=c.text:
                                     translator.translate(ch, context_before=before,
-                                                         context_after=after, related_text=full)
+                                                         context_after=after, related_text=full),
+                                timeout=long_timeout,
                             )
                             translated_parts.append(part)
                             partial_text = join_translations(translated_parts, c.text)
@@ -521,7 +554,8 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
                         result = await _run_in_executor(
                             lambda text=c.text, before=context_before, after=context_after:
                                 translator.translate(text, context_before=before,
-                                                     context_after=after)
+                                                     context_after=after),
+                            timeout=long_timeout,
                         )
 
                     translations[c.line_start] = result
@@ -681,6 +715,7 @@ async def ws_generate_comments(ws: WebSocket) -> None:
             include_date=req.include_date,
             date_format=req.date_format,
             custom_tags=[HeaderTag(name=tag.name, value=tag.value) for tag in req.custom_tags],
+            language=req.language,
         )
         count = 0
 

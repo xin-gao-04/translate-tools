@@ -24,9 +24,10 @@ class HeaderCommentOptions:
     include_date: bool = False
     date_format: str = "%Y-%m-%d"
     custom_tags: list[HeaderTag] = field(default_factory=list)
+    language: str = "zh"
 
 
-_SYSTEM = """\
+_SYSTEM_ZH = """\
 You are a C++ documentation expert. Generate a Doxygen comment for the given C++ symbol.
 
 Rules:
@@ -36,7 +37,33 @@ Rules:
 4. If implementation is unavailable, infer only from the declaration.
 5. Do not invent behavior that is not supported by the provided code.
 6. Output ONLY the comment block.
+7. Write all descriptive text in Chinese (中文). Keep @-tags, parameter names, and code identifiers in English.
 """
+
+_SYSTEM_EN = """\
+You are a C++ documentation expert. Generate a Doxygen comment for the given C++ symbol.
+
+Rules:
+1. Use /** ... */ format with lines prefixed by " * ".
+2. Be concise and technical.
+3. Use the declaration and implementation snippet when available.
+4. If implementation is unavailable, infer only from the declaration.
+5. Do not invent behavior that is not supported by the provided code.
+6. Output ONLY the comment block.
+7. Write all descriptive text in English.
+"""
+
+_SYSTEM_TRANSLATE = """\
+You are a C++ documentation expert and technical translator. \
+Translate the existing Doxygen comment into {target_lang} while preserving its \
+structure, @-tags, parameter names, and code identifiers. \
+Output ONLY the translated comment block in /** ... */ format.
+"""
+
+
+def _detect_chinese(text: str) -> bool:
+    """Return True if *text* contains any CJK Unified Ideograph."""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
 
 def generate_doxygen(
@@ -68,7 +95,34 @@ def generate_symbol_comment(
     options: HeaderCommentOptions,
     chunk_callback=None,
 ) -> str:
-    """Generate a configurable Doxygen comment for *symbol*."""
+    """Generate a configurable Doxygen comment for *symbol*.
+
+    Language-aware logic:
+    - If the symbol already has a comment, detect its language:
+      - If the existing comment matches the target language → skip (return as-is).
+      - If it doesn't match → translate the existing comment.
+    - If no comment exists → generate a new one in the target language.
+    """
+    target_lang = options.language or "zh"
+
+    # ── Handle existing comments: detect language and possibly translate ──
+    if symbol.has_comment and symbol.existing_comment.strip():
+        existing = symbol.existing_comment.strip()
+        is_chinese = _detect_chinese(existing)
+
+        # Already in the target language → return unchanged
+        if (target_lang == "zh" and is_chinese) or (target_lang == "en" and not is_chinese):
+            return existing
+
+        # Translate existing comment to the target language
+        lang_name = "Chinese (中文)" if target_lang == "zh" else "English"
+        system = _SYSTEM_TRANSLATE.format(target_lang=lang_name)
+        prompt = f"Translate this Doxygen comment to {lang_name}:\n\n{existing}"
+        result = translator.generate(prompt, system=system, chunk_callback=chunk_callback)
+        return _normalize_comment(result, symbol, options)
+
+    # ── Generate new comment ────────────────────────────────────────────
+    system = _SYSTEM_ZH if target_lang == "zh" else _SYSTEM_EN
 
     symbol_desc = "member function" if symbol.kind == "function" else "variable"
     context_lines: list[str] = [
@@ -104,7 +158,7 @@ def generate_symbol_comment(
         rules.append("Do not include @return.")
 
     prompt = "\n\n".join(context_lines + ["Formatting requirements: " + " ".join(rules)])
-    result = translator.generate(prompt, system=_SYSTEM, chunk_callback=chunk_callback)
+    result = translator.generate(prompt, system=system, chunk_callback=chunk_callback)
     return _normalize_comment(result, symbol, options)
 
 
