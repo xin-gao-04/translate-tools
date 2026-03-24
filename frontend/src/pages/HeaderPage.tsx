@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CommentLanguage, HeaderConfig, HeaderSymbol, HeaderWsEvent, Settings } from '../types'
 import {
   apiAnalyzeHeader,
@@ -54,6 +54,8 @@ export default function HeaderPage({ settings }: Props) {
   const [previewingPath, setPreviewingPath] = useState<string | null>(null)
   const [expandedLine, setExpandedLine] = useState<number | null>(null)
   const [config, setConfig] = useState<HeaderConfig>(DEFAULT_CONFIG)
+  const [autoApplyAndNext, setAutoApplyAndNext] = useState(false)
+  const [queuedAutoStartPath, setQueuedAutoStartPath] = useState<string | null>(null)
   const wsRef = useRef<{ stop: () => void } | null>(null)
   const dragCounter = useRef(0)
   const mainBodyRef = useRef<HTMLDivElement>(null)
@@ -240,6 +242,48 @@ export default function HeaderPage({ settings }: Props) {
     return comments
   }
 
+  const findNextFilePath = useCallback((path: string) => {
+    const currentIndex = files.findIndex(file => file.path === path)
+    if (currentIndex < 0) return null
+
+    for (let i = currentIndex + 1; i < files.length; i += 1) {
+      const nextPath = files[i]?.path
+      if (nextPath && HEADER_EXT_RE.test(nextPath)) {
+        return nextPath
+      }
+    }
+    return null
+  }, [files])
+
+  const applyGeneratedComments = useCallback(async (
+    path: string,
+    comments: Record<string, string>,
+    successMessage?: string,
+  ) => {
+    if (Object.keys(comments).length === 0) {
+      setStatusMsg('当前文件没有可写入的注释')
+      return false
+    }
+
+    setStatusMsg(`写入文件: ${basename(path)}…`)
+    const result = await apiApplyComments(path, comments, config.replaceExisting)
+    if (!result.ok) {
+      setStatusMsg(`✗ ${result.error ?? '写入失败'}`)
+      updateFileEntry(path, entry => ({ ...entry, status: 'error' }))
+      return false
+    }
+
+    setDiffsByPath(prev => {
+      const next = { ...prev }
+      delete next[path]
+      return next
+    })
+
+    await loadFile(path, true)
+    setStatusMsg(successMessage ?? `✓ 已写入 ${Object.keys(comments).length} 条注释`)
+    return true
+  }, [config.replaceExisting, loadFile, updateFileEntry])
+
   const handleGenerate = useCallback(() => {
     if (!selectedFile || generatingPath) return
 
@@ -261,9 +305,12 @@ export default function HeaderPage({ settings }: Props) {
     updateFileEntry(selectedFile, entry => ({ ...entry, status: 'running' }))
     setStatusMsg('生成注释中…')
 
+    const generationPath = selectedFile
+    const generatedComments: Record<string, string> = {}
+
     setSymbolsByPath(prev => ({
       ...prev,
-      [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+      [generationPath]: (prev[generationPath] ?? []).map(symbol =>
         targetSymbols.some(target => target.line_start === symbol.line_start)
           ? {
               ...symbol,
@@ -280,7 +327,7 @@ export default function HeaderPage({ settings }: Props) {
         case 'symbol_started':
           setSymbolsByPath(prev => ({
             ...prev,
-            [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+            [generationPath]: (prev[generationPath] ?? []).map(symbol =>
               symbol.line_start === evt.line
                 ? { ...symbol, generate_status: 'running' as const, generate_partial: '' }
                 : symbol
@@ -291,7 +338,7 @@ export default function HeaderPage({ settings }: Props) {
         case 'comment_chunk':
           setSymbolsByPath(prev => ({
             ...prev,
-            [selectedFile]: (prev[selectedFile] ?? []).map(symbol =>
+            [generationPath]: (prev[generationPath] ?? []).map(symbol =>
               symbol.line_start === evt.line
                 ? { ...symbol, generate_status: 'running' as const, generate_partial: evt.partial }
                 : symbol
@@ -299,30 +346,64 @@ export default function HeaderPage({ settings }: Props) {
           }))
           break
         case 'comment_done':
+          generatedComments[String(evt.line)] = evt.comment
           setSymbolsByPath(prev => {
-            const nextSymbols = (prev[selectedFile] ?? []).map(symbol =>
+            const nextSymbols = (prev[generationPath] ?? []).map(symbol =>
               symbol.line_start === evt.line
                 ? {
                     ...symbol,
                     generate_status: 'done' as const,
                     generated_comment: evt.comment,
                     generate_partial: undefined,
-                  }
+                }
                 : symbol
             )
-            queueMicrotask(() => syncFileFromSymbols(selectedFile, nextSymbols))
-            return { ...prev, [selectedFile]: nextSymbols }
+            queueMicrotask(() => syncFileFromSymbols(generationPath, nextSymbols))
+            return { ...prev, [generationPath]: nextSymbols }
           })
           break
         case 'all_done':
           setGeneratingPath(null)
-          updateFileEntry(selectedFile, entry => ({ ...entry, status: 'done' }))
-          setStatusMsg(`✓ 已生成 ${evt.count} 条注释，先预览 diff 再写入文件`)
           wsRef.current = null
+          if (autoApplyAndNext) {
+            void (async () => {
+              const applied = await applyGeneratedComments(
+                generationPath,
+                generatedComments,
+                `✓ 已自动写入 ${evt.count} 条注释`
+              )
+              if (!applied) return
+
+              const nextPath = findNextFilePath(generationPath)
+              if (!nextPath) {
+                setSelectedFile(generationPath)
+                setQueuedAutoStartPath(null)
+                setStatusMsg(`✓ 已完成 ${basename(generationPath)}，没有更多文件了`)
+                return
+              }
+
+              setSelectedFile(nextPath)
+              setExpandedLine(null)
+              await loadFile(nextPath)
+              setQueuedAutoStartPath(nextPath)
+              setStatusMsg(`继续处理下一个文件: ${basename(nextPath)}`)
+              queueMicrotask(() => {
+                setGeneratingPath(null)
+                updateFileEntry(generationPath, entry => ({ ...entry, status: 'done' }))
+              })
+            })().catch(err => {
+              const message = err instanceof Error ? err.message : String(err)
+              updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
+              setStatusMsg(`✗ ${message}`)
+            })
+          } else {
+            updateFileEntry(generationPath, entry => ({ ...entry, status: 'done' }))
+            setStatusMsg(`✓ 已生成 ${evt.count} 条注释，先预览 diff 再写入文件`)
+          }
           break
         case 'error':
           setGeneratingPath(null)
-          updateFileEntry(selectedFile, entry => ({ ...entry, status: 'error' }))
+          updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
           setStatusMsg(`✗ ${evt.message}`)
           wsRef.current = null
           break
@@ -331,17 +412,30 @@ export default function HeaderPage({ settings }: Props) {
 
     wsRef.current = startHeaderGeneration(
       settings,
-      selectedFile,
+      generationPath,
       targetSymbols.map(symbol => symbol.line_start),
       config,
       onEvent,
     )
-  }, [config, generatingPath, selectedFile, settings, symbolsByPath, syncFileFromSymbols, updateFileEntry])
+  }, [applyGeneratedComments, autoApplyAndNext, config, findNextFilePath, generatingPath, loadFile, selectedFile, settings, symbolsByPath, syncFileFromSymbols, updateFileEntry])
+
+  useEffect(() => {
+    if (!queuedAutoStartPath) return
+    if (selectedFile !== queuedAutoStartPath) return
+    if (generatingPath) return
+    if ((symbolsByPath[queuedAutoStartPath] ?? []).length === 0) return
+
+    setQueuedAutoStartPath(null)
+    queueMicrotask(() => {
+      handleGenerate()
+    })
+  }, [generatingPath, handleGenerate, queuedAutoStartPath, selectedFile, symbolsByPath])
 
   const handleStop = useCallback(() => {
     wsRef.current?.stop()
     wsRef.current = null
     setGeneratingPath(null)
+    setQueuedAutoStartPath(null)
     if (selectedFile) {
       updateFileEntry(selectedFile, entry => ({ ...entry, status: 'pending' }))
     }
@@ -373,27 +467,8 @@ export default function HeaderPage({ settings }: Props) {
   const handleApply = useCallback(async () => {
     if (!selectedFile) return
     const comments = generatedCommentsFor(selectedFile)
-    if (Object.keys(comments).length === 0) {
-      setStatusMsg('当前文件没有可写入的注释')
-      return
-    }
-
-    setStatusMsg('写入文件…')
-    const result = await apiApplyComments(selectedFile, comments, config.replaceExisting)
-    if (!result.ok) {
-      setStatusMsg(`✗ ${result.error ?? '写入失败'}`)
-      updateFileEntry(selectedFile, entry => ({ ...entry, status: 'error' }))
-      return
-    }
-
-    setDiffsByPath(prev => {
-      const next = { ...prev }
-      delete next[selectedFile]
-      return next
-    })
-    await loadFile(selectedFile, true)
-    setStatusMsg(`✓ 已写入 ${Object.keys(comments).length} 条注释`)
-  }, [config.replaceExisting, loadFile, selectedFile, updateFileEntry, symbolsByPath])
+    await applyGeneratedComments(selectedFile, comments)
+  }, [applyGeneratedComments, selectedFile, symbolsByPath])
 
   return (
     <div className="page-layout">
@@ -454,6 +529,7 @@ export default function HeaderPage({ settings }: Props) {
                 setSelectedFile(null)
                 setGeneratingPath(null)
                 setPreviewingPath(null)
+                setQueuedAutoStartPath(null)
                 setStatusMsg('已清空头文件列表')
               }}
             >
@@ -499,6 +575,14 @@ export default function HeaderPage({ settings }: Props) {
                     onChange={e => updateConfig({ includeReturn: e.target.checked })}
                   />
                   <span>@return</span>
+                </label>
+                <label className="hdr-check">
+                  <input
+                    type="checkbox"
+                    checked={autoApplyAndNext}
+                    onChange={e => setAutoApplyAndNext(e.target.checked)}
+                  />
+                  <span>生成后自动写入并继续下一个文件</span>
                 </label>
               </div>
 

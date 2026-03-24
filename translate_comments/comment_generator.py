@@ -175,30 +175,80 @@ def _normalize_comment(
         lines = lines[:-1]
     result = "\n".join(lines).strip()
 
-    if not result.startswith("/**"):
-        result = f"/**\n * {result}\n */"
+    content_lines = _comment_content_lines(result)
+    filtered_content: list[str] = []
+    managed_tags = {"author"}
+    if options.include_date:
+        managed_tags.add("date")
+    managed_tags.update(
+        tag.name.strip().lstrip("@").lower()
+        for tag in options.custom_tags
+        if tag.name.strip()
+    )
 
-    body = result.splitlines()
-    filtered: list[str] = []
-    for line in body:
+    for line in content_lines:
         stripped = line.strip()
-        if not options.include_brief and "@brief" in stripped:
+        normalized = stripped.lower()
+        if not options.include_brief and normalized.startswith("@brief"):
             continue
-        if (symbol.kind != "function" or not options.include_params) and "@param" in stripped:
+        if (symbol.kind != "function" or not options.include_params) and normalized.startswith("@param"):
             continue
-        if (symbol.kind != "function" or not options.include_return) and "@return" in stripped:
+        if (symbol.kind != "function" or not options.include_return) and normalized.startswith("@return"):
             continue
-        filtered.append(line)
+        if normalized.startswith("@"):
+            tag_name = normalized[1:].split(None, 1)[0]
+            if tag_name in managed_tags:
+                continue
+        filtered_content.append(line)
 
-    if not filtered:
-        filtered = ["/**", " */"]
+    for extra in _tag_lines(options):
+        filtered_content.append(extra.removeprefix(" * ").rstrip())
 
-    insert_at = len(filtered) - 1 if filtered[-1].strip() == "*/" else len(filtered)
-    extra_lines = _tag_lines(options)
-    if extra_lines:
-        filtered[insert_at:insert_at] = extra_lines
+    if not filtered_content:
+        return "/**\n */"
 
-    return "\n".join(filtered)
+    normalized_lines = ["/**"]
+    normalized_lines.extend(
+        f" * {line}" if line else " *"
+        for line in filtered_content
+    )
+    normalized_lines.append(" */")
+    return "\n".join(normalized_lines)
+
+
+def _comment_content_lines(comment: str) -> list[str]:
+    result = comment.strip()
+    if not result.startswith("/**"):
+        return [line.strip() for line in result.splitlines() if line.strip()]
+
+    end_idx = result.rfind("*/")
+    if end_idx == -1:
+        core = result[3:]
+        trailing = ""
+    else:
+        core = result[3:end_idx]
+        trailing = result[end_idx + 2 :]
+
+    lines = core.splitlines()
+    if len(lines) == 1 and "*/" in result and "\n" not in result:
+        single = lines[0].strip()
+        if single.endswith("*/"):
+            single = single[:-2].rstrip()
+        lines = [single]
+
+    trailing_lines = trailing.splitlines()
+    normalized_lines: list[str] = []
+    for line in [*lines, *trailing_lines]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "/**" or stripped == "*/":
+            continue
+        if stripped.startswith("*"):
+            stripped = stripped[1:].lstrip()
+        if stripped:
+            normalized_lines.append(stripped)
+    return normalized_lines
 
 
 def _tag_lines(options: HeaderCommentOptions) -> list[str]:

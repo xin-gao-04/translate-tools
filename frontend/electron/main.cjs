@@ -48,21 +48,50 @@ function resolvePythonLauncher () {
   return { command: 'python3', prefixArgs: [] }
 }
 
-function startBackend () {
-  const pythonCmd = ['-m', 'translate_comments.api', '--port', String(API_PORT)]
-  const launcher = resolvePythonLauncher()
+function resolveBackendLauncher () {
+  if (!isDev) {
+    const bundledExe = path.join(process.resourcesPath, 'backend', 'translate-comments-backend.exe')
+    if (fs.existsSync(bundledExe)) {
+      return {
+        command: bundledExe,
+        prefixArgs: [],
+        cwd: path.dirname(bundledExe),
+        extraPath: [],
+      }
+    }
+  }
 
-  // In dev, run from the project root (one level up from frontend/)
+  const python = resolvePythonLauncher()
   const cwd = isDev
-    ? path.join(__dirname, '..', '..')  // translate-tool/
+    ? path.join(__dirname, '..', '..')
     : path.join(process.resourcesPath, 'backend')
+  const runtimeRoot = isDev ? null : path.join(process.resourcesPath, 'backend-runtime')
 
-  backendProcess = spawn(launcher.command, [...launcher.prefixArgs, ...pythonCmd], {
+  return {
+    command: python.command,
+    prefixArgs: [...python.prefixArgs, '-m', 'translate_comments.api'],
     cwd,
+    extraPath: [
+      runtimeRoot,
+      runtimeRoot && path.join(runtimeRoot, 'Scripts'),
+    ].filter(Boolean),
+  }
+}
+
+function startBackend () {
+  const launcher = resolveBackendLauncher()
+  const pathEntries = [
+    ...launcher.extraPath,
+    process.env.PATH,
+  ].filter(Boolean)
+
+  backendProcess = spawn(launcher.command, [...launcher.prefixArgs, '--port', String(API_PORT)], {
+    cwd: launcher.cwd,
     env: {
       ...process.env,
+      PATH: pathEntries.join(path.delimiter),
       PYTHONUNBUFFERED: '1',
-      PYTHONPATH: [cwd, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      PYTHONPATH: [launcher.cwd, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     },
   })
 

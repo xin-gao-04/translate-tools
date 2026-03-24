@@ -10,13 +10,17 @@ $electronInstallScript = Join-Path $frontendRoot "node_modules\electron\install.
 $viteCli = Join-Path $frontendRoot "node_modules\vite\bin\vite.js"
 $appRoot = Join-Path $outputRoot "resources\app"
 $backendRoot = Join-Path $outputRoot "resources\backend"
-$backendRuntimeRoot = Join-Path $outputRoot "resources\backend-runtime"
 $appPackageJson = Join-Path $appRoot "package.json"
 $portableReadme = Join-Path $outputRoot "README-portable.txt"
-$venvRoot = Join-Path $repoRoot ".venv"
+$backendBuildScript = Join-Path $scriptRoot "build-python-backend.ps1"
+$backendBuiltRoot = Join-Path $repoRoot "release\backend-exe\translate-comments-backend"
 
 if (-not (Test-Path $viteCli)) {
   throw "Vite CLI not found: $viteCli"
+}
+
+if (-not (Test-Path $backendBuildScript)) {
+  throw "Backend build script not found: $backendBuildScript"
 }
 
 if (-not (Test-Path $electronDist)) {
@@ -58,6 +62,12 @@ try {
   Pop-Location
 }
 
+& powershell -ExecutionPolicy Bypass -File $backendBuildScript
+
+if (-not (Test-Path $backendBuiltRoot)) {
+  throw "Bundled backend not found after build: $backendBuiltRoot"
+}
+
 Get-Process | Where-Object {
   $_.Path -and (
     $_.Path -eq (Join-Path $outputRoot "translate-comments.exe") -or
@@ -82,24 +92,14 @@ if (Test-Path (Join-Path $outputRoot "resources\default_app.asar")) {
 
 New-Item -ItemType Directory -Force -Path $appRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $backendRoot | Out-Null
-if (Test-Path $venvRoot) {
-  New-Item -ItemType Directory -Force -Path $backendRuntimeRoot | Out-Null
-}
 
 Copy-Item -Force (Join-Path $frontendRoot "package.json") $appPackageJson
 Copy-Item -Recurse -Force (Join-Path $frontendRoot "dist") $appRoot
 Copy-Item -Recurse -Force (Join-Path $frontendRoot "electron") $appRoot
-Copy-Item -Recurse -Force (Join-Path $repoRoot "translate_comments") $backendRoot
-Copy-Item -Force (Join-Path $repoRoot "requirements.txt") $backendRoot
-if (Test-Path $venvRoot) {
-  Copy-Item -Recurse -Force (Join-Path $venvRoot "*") $backendRuntimeRoot
-}
+Copy-Item -Recurse -Force (Join-Path $backendBuiltRoot "*") $backendRoot
 
 Get-ChildItem -Path $backendRoot -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 Get-ChildItem -Path $backendRoot -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
-if (Test-Path $backendRuntimeRoot) {
-  Get-ChildItem -Path $backendRuntimeRoot -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
-}
 
 @"
 translate-comments portable package
@@ -108,8 +108,7 @@ Run:
   .\translate-comments.exe
 
 Runtime notes:
-  - The packaged frontend will prefer .\resources\backend-runtime\Scripts\python.exe
-    when present.
-  - If the bundled runtime cannot be used on the target machine, set
-    TRANSLATE_COMMENTS_PYTHON to a usable python.exe path before launch.
+  - The packaged frontend will launch .\resources\backend\translate-comments-backend.exe.
+  - If the backend executable is missing or cannot start, the app falls back
+    to Python-based startup when TRANSLATE_COMMENTS_PYTHON is set.
 "@ | Set-Content -Encoding ASCII $portableReadme
