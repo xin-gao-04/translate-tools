@@ -19,6 +19,7 @@ const API_PORT = 8765
 
 let mainWindow = null
 let backendProcess = null
+let ownsBackendProcess = false
 
 // ── Start Python backend ──────────────────────────────────────────────────────
 
@@ -97,6 +98,7 @@ function startBackend () {
 
   backendProcess.stdout.on('data', d => process.stdout.write(`[backend] ${d}`))
   backendProcess.stderr.on('data', d => process.stderr.write(`[backend] ${d}`))
+  ownsBackendProcess = true
   backendProcess.on('error', err => {
     console.error(`[backend] failed to start: ${err.message}`)
   })
@@ -104,6 +106,7 @@ function startBackend () {
     if (code !== 0 && code !== null)
       console.error(`[backend] exited with code ${code}`)
     backendProcess = null
+    ownsBackendProcess = false
   })
 }
 
@@ -230,7 +233,14 @@ ipcMain.handle('ollama:translateText', async (_event, payload) => {
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
-  startBackend()
+  let backendAlreadyRunning = false
+  try {
+    await waitForBackend()
+    backendAlreadyRunning = true
+    console.log('[backend] reusing existing backend on port', API_PORT)
+  } catch {
+    startBackend()
+  }
 
   // Wait for both Vite dev server and Python backend in parallel
   const waits = [
@@ -245,7 +255,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  if (backendProcess) backendProcess.kill()
+  if (backendProcess && ownsBackendProcess) backendProcess.kill()
   if (process.platform !== 'darwin') app.quit()
 })
 

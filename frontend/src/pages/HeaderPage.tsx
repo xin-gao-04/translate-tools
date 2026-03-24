@@ -54,7 +54,7 @@ export default function HeaderPage({ settings }: Props) {
   const [previewingPath, setPreviewingPath] = useState<string | null>(null)
   const [expandedLine, setExpandedLine] = useState<number | null>(null)
   const [config, setConfig] = useState<HeaderConfig>(DEFAULT_CONFIG)
-  const [autoApplyAndNext, setAutoApplyAndNext] = useState(false)
+  const [autoApplyAndNext, setAutoApplyAndNext] = useState(true)
   const [queuedAutoStartPath, setQueuedAutoStartPath] = useState<string | null>(null)
   const wsRef = useRef<{ stop: () => void } | null>(null)
   const dragCounter = useRef(0)
@@ -98,9 +98,9 @@ export default function HeaderPage({ settings }: Props) {
     }))
   }, [updateFileEntry])
 
-  const loadFile = useCallback(async (path: string, force = false) => {
+  const loadFile = useCallback(async (path: string, force = false): Promise<{ ok: boolean; symbolCount: number }> => {
     if (!force && symbolsByPath[path]) {
-      return
+      return { ok: true, symbolCount: (symbolsByPath[path] ?? []).length }
     }
 
     updateFileEntry(path, entry => ({ ...entry, status: 'running' }))
@@ -110,18 +110,19 @@ export default function HeaderPage({ settings }: Props) {
     if (result.error) {
       updateFileEntry(path, entry => ({ ...entry, status: 'error' }))
       setStatusMsg(`✗ ${result.error}`)
-      return
+      return { ok: false, symbolCount: 0 }
     }
 
     const symbols = (result.symbols ?? []).map(symbol => ({
       ...symbol,
-      selected: !symbol.has_comment,
+      selected: true,
       generate_status: 'idle' as const,
     }))
 
     setSymbolsByPath(prev => ({ ...prev, [path]: symbols }))
     syncFileFromSymbols(path, symbols)
     setStatusMsg(`已找到 ${symbols.length} 个对象（函数 + 变量）`)
+    return { ok: true, symbolCount: symbols.length }
   }, [symbolsByPath, syncFileFromSymbols, updateFileEntry])
 
   const handleSelectFile = useCallback(async (path: string) => {
@@ -255,6 +256,29 @@ export default function HeaderPage({ settings }: Props) {
     return null
   }, [files])
 
+  const continueToNextFile = useCallback(async (currentPath: string, messagePrefix: string) => {
+    let nextPath = findNextFilePath(currentPath)
+    while (nextPath) {
+      setSelectedFile(nextPath)
+      setExpandedLine(null)
+      const loaded = await loadFile(nextPath)
+      if (loaded.ok && loaded.symbolCount > 0) {
+        setQueuedAutoStartPath(nextPath)
+        setStatusMsg(`${messagePrefix}，继续处理: ${basename(nextPath)}`)
+        return true
+      }
+      if (loaded.ok) {
+        updateFileEntry(nextPath, entry => ({ ...entry, status: 'done' }))
+      }
+      nextPath = findNextFilePath(nextPath)
+    }
+
+    setQueuedAutoStartPath(null)
+    setSelectedFile(currentPath)
+    setStatusMsg(`${messagePrefix}，没有更多文件了`)
+    return false
+  }, [findNextFilePath, loadFile, updateFileEntry])
+
   const applyGeneratedComments = useCallback(async (
     path: string,
     comments: Record<string, string>,
@@ -292,7 +316,20 @@ export default function HeaderPage({ settings }: Props) {
       symbol.selected && (config.replaceExisting || !symbol.has_comment)
     )
     if (targetSymbols.length === 0) {
-      setStatusMsg('没有需要生成的对象，请检查选择项或“替换已有注释”配置')
+      const selectedCount = symbols.filter(symbol => symbol.selected).length
+      const hasOnlyExistingComments = selectedCount > 0 && symbols
+        .filter(symbol => symbol.selected)
+        .every(symbol => symbol.has_comment)
+
+      let message = `⚠ ${basename(selectedFile)} 没有需要生成的对象，已跳过`
+      if (selectedCount === 0) {
+        message = `⚠ ${basename(selectedFile)} 没有选中的对象，已跳过`
+      } else if (!config.replaceExisting && hasOnlyExistingComments) {
+        message = `⚠ ${basename(selectedFile)} 当前对象均已有注释且未开启替换，已跳过`
+      }
+
+      updateFileEntry(selectedFile, entry => ({ ...entry, status: 'done' }))
+      void continueToNextFile(selectedFile, message)
       return
     }
 
@@ -367,45 +404,58 @@ export default function HeaderPage({ settings }: Props) {
           wsRef.current = null
           if (autoApplyAndNext) {
             void (async () => {
-              const applied = await applyGeneratedComments(
-                generationPath,
-                generatedComments,
-                `✓ 已自动写入 ${evt.count} 条注释`
-              )
-              if (!applied) return
+              const generatedCount = Object.keys(generatedComments).length
+              let messagePrefix = `✓ 已完成 ${basename(generationPath)}`
 
-              const nextPath = findNextFilePath(generationPath)
-              if (!nextPath) {
-                setSelectedFile(generationPath)
-                setQueuedAutoStartPath(null)
-                setStatusMsg(`✓ 已完成 ${basename(generationPath)}，没有更多文件了`)
-                return
+              if (generatedCount > 0) {
+                const applied = await applyGeneratedComments(
+                  generationPath,
+                  generatedComments,
+                  `✓ 已自动写入 ${evt.count} 条注释`
+                )
+                if (applied) {
+                  updateFileEntry(generationPath, entry => ({ ...entry, status: 'done' }))
+                  messagePrefix = `✓ 已自动写入 ${evt.count} 条注释`
+                } else {
+                  updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
+                  messagePrefix = `✗ ${basename(generationPath)} 写入失败，已跳过`
+                }
+              } else {
+                updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
+                messagePrefix = `⚠ ${basename(generationPath)} 没有生成可写入的注释，已跳过`
               }
 
-              setSelectedFile(nextPath)
-              setExpandedLine(null)
-              await loadFile(nextPath)
-              setQueuedAutoStartPath(nextPath)
-              setStatusMsg(`继续处理下一个文件: ${basename(nextPath)}`)
-              queueMicrotask(() => {
-                setGeneratingPath(null)
-                updateFileEntry(generationPath, entry => ({ ...entry, status: 'done' }))
-              })
+              await continueToNextFile(generationPath, messagePrefix)
             })().catch(err => {
               const message = err instanceof Error ? err.message : String(err)
               updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
-              setStatusMsg(`✗ ${message}`)
+              void continueToNextFile(generationPath, `✗ ${message}`)
             })
           } else {
             updateFileEntry(generationPath, entry => ({ ...entry, status: 'done' }))
             setStatusMsg(`✓ 已生成 ${evt.count} 条注释，先预览 diff 再写入文件`)
           }
           break
+        case 'symbol_error':
+          setSymbolsByPath(prev => ({
+            ...prev,
+            [generationPath]: (prev[generationPath] ?? []).map(symbol =>
+              symbol.line_start === evt.line
+                ? { ...symbol, generate_status: 'error' as const, generate_partial: undefined }
+                : symbol
+            ),
+          }))
+          setStatusMsg(`⚠ ${evt.name} 生成失败，继续处理剩余符号`)
+          break
         case 'error':
           setGeneratingPath(null)
           updateFileEntry(generationPath, entry => ({ ...entry, status: 'error' }))
-          setStatusMsg(`✗ ${evt.message}`)
           wsRef.current = null
+          if (autoApplyAndNext) {
+            void continueToNextFile(generationPath, `✗ ${basename(generationPath)} 出错: ${evt.message}`)
+          } else {
+            setStatusMsg(`✗ ${evt.message}`)
+          }
           break
       }
     }
@@ -417,7 +467,7 @@ export default function HeaderPage({ settings }: Props) {
       config,
       onEvent,
     )
-  }, [applyGeneratedComments, autoApplyAndNext, config, findNextFilePath, generatingPath, loadFile, selectedFile, settings, symbolsByPath, syncFileFromSymbols, updateFileEntry])
+  }, [applyGeneratedComments, autoApplyAndNext, config, continueToNextFile, generatingPath, selectedFile, settings, symbolsByPath, syncFileFromSymbols, updateFileEntry])
 
   useEffect(() => {
     if (!queuedAutoStartPath) return

@@ -65,6 +65,7 @@ export type HeaderWsEvent =
   | { type: 'symbol_started';   name: string; kind: HeaderSymbol['kind']; line: number }
   | { type: 'comment_chunk';    name: string; line: number; partial: string }
   | { type: 'comment_done';     name: string; kind: HeaderSymbol['kind']; line: number; comment: string }
+  | { type: 'symbol_error';     name: string; kind: HeaderSymbol['kind']; line: number; message: string }
   | { type: 'all_done';         count: number }
   | { type: 'error';            message: string }
 

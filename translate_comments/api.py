@@ -269,9 +269,13 @@ async def apply_comments(req: ApplyCommentsRequest) -> dict:
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
-    comments = {int(line): text for line, text in req.comments.items()}
-    new_source = apply_header_comments(source, symbols, comments, req.replace_existing)
-    path.write_text(new_source, encoding="utf-8")
+    try:
+        comments = {int(line): text for line, text in req.comments.items()}
+        new_source = apply_header_comments(source, symbols, comments, req.replace_existing)
+        path.write_text(new_source, encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
     return {"ok": True}
 
 
@@ -361,8 +365,11 @@ async def ws_translate(ws: WebSocket) -> None:  # noqa: C901
         parser = get_parser_for_path(path_str)
         if not parser:
             return (f"No parser for {path.name}",)
-        all_comments = parser.extract_comments(source)
-        english = [c for c in all_comments if is_english(c.text)]
+        try:
+            all_comments = parser.extract_comments(source)
+            english = [c for c in all_comments if is_english(c.text)]
+        except Exception as exc:  # noqa: BLE001
+            return (f"解析文件失败: {exc}",)
         return source.splitlines(), english, len(all_comments)
 
     prepared = await asyncio.gather(*[_prepare_file(p) for p in req.paths])
@@ -740,24 +747,34 @@ async def ws_generate_comments(ws: WebSocket) -> None:
                     loop,
                 )
 
-            comment = await loop.run_in_executor(
-                None,
-                lambda current=symbol: generate_symbol_comment(
-                    current,
-                    translator,
-                    options,
-                    chunk_callback=on_chunk,
-                ),
-            )
+            try:
+                comment = await loop.run_in_executor(
+                    None,
+                    lambda current=symbol: generate_symbol_comment(
+                        current,
+                        translator,
+                        options,
+                        chunk_callback=on_chunk,
+                    ),
+                )
 
-            await ws.send_json({
-                "type": "comment_done",
-                "name": symbol.name,
-                "kind": symbol.kind,
-                "line": symbol.line_start,
-                "comment": comment,
-            })
-            count += 1
+                await ws.send_json({
+                    "type": "comment_done",
+                    "name": symbol.name,
+                    "kind": symbol.kind,
+                    "line": symbol.line_start,
+                    "comment": comment,
+                })
+                count += 1
+            except Exception as exc:  # noqa: BLE001
+                await ws.send_json({
+                    "type": "symbol_error",
+                    "name": symbol.name,
+                    "kind": symbol.kind,
+                    "line": symbol.line_start,
+                    "message": str(exc),
+                })
+                # Continue to the next symbol instead of aborting the whole file
 
         await ws.send_json({"type": "all_done", "count": count})
 
