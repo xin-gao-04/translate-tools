@@ -438,6 +438,15 @@ def _make_symbol(
     )
 
 
+def _is_macro_continuation(raw: str, in_macro_definition: bool) -> tuple[bool, bool]:
+    stripped = raw.lstrip()
+    if in_macro_definition:
+        return True, raw.rstrip().endswith("\\")
+    if stripped.startswith("#"):
+        return True, raw.rstrip().endswith("\\")
+    return False, False
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:  # noqa: C901
@@ -451,12 +460,18 @@ def parse_header_symbols(source: str) -> list[HeaderSymbolInfo]:  # noqa: C901
     scope_stack: list[tuple[str, str, int]] = []
     brace_depth = 0
     pending_scope: tuple[str, str] | None = None
+    in_macro_definition = False
     seen_lines: set[int] = set()
 
     i = 0
     while i < len(proc_lines):
         raw = proc_lines[i]
         stripped = raw.strip()
+
+        should_skip, in_macro_definition = _is_macro_continuation(raw, in_macro_definition)
+        if should_skip:
+            i += 1
+            continue
 
         # ── Step 1: unconditional brace accounting ────────────────────────────
         opens = raw.count("{")

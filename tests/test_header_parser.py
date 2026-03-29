@@ -85,3 +85,20 @@ extern int g_counter;
         (7, "run", "function"),
         (10, "g_counter", "variable"),
     ]
+
+
+def test_skips_macro_definition_continuation_lines() -> None:
+    source = """
+#define DECLARE_STUFF() \\
+    int bad_macro; \\
+    void bad_func(); \\
+    static constexpr int kBad = 1;
+
+class Demo {
+public:
+    void ok();
+};
+    """
+    assert _symbols(source) == [
+        (9, "ok", "function"),
+    ]

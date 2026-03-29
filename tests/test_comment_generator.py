@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from translate_comments.comment_generator import HeaderCommentOptions, _normalize_comment
 from translate_comments.header_parser import HeaderSymbolInfo
 
@@ -20,6 +22,7 @@ def _symbol() -> HeaderSymbolInfo:
 
 def test_normalize_comment_keeps_author_and_date_inside_block() -> None:
     raw = "/** @brief Draw both antenna gain patterns. */\n * @author model\n * @date 2026-03-23"
+    expected_date = datetime.now().strftime("%Y-%m-%d")
     normalized = _normalize_comment(
         raw,
         _symbol(),
@@ -30,6 +33,23 @@ def test_normalize_comment_keeps_author_and_date_inside_block() -> None:
         "/**\n"
         " * @brief Draw both antenna gain patterns.\n"
         " * @author fzone\n"
-        " * @date 2026-03-23\n"
+        f" * @date {expected_date}\n"
+        " */"
+    )
+
+
+def test_normalize_comment_removes_declaration_echo_lines() -> None:
+    raw = (
+        "/**\n"
+        " * Declaration:\n"
+        " * bool PlotBoth(XsfEM_Rcvr* rcvrPtr);\n"
+        " * @brief 绘制双天线方向图。\n"
+        " */"
+    )
+    normalized = _normalize_comment(raw, _symbol(), HeaderCommentOptions())
+
+    assert normalized == (
+        "/**\n"
+        " * @brief 绘制双天线方向图。\n"
         " */"
     )

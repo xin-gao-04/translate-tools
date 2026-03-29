@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 
 from .header_parser import FunctionInfo, HeaderSymbolInfo
 from .translator import OllamaTranslator
@@ -185,6 +186,12 @@ def _normalize_comment(
         for tag in options.custom_tags
         if tag.name.strip()
     )
+    signature_line_norms = {
+        _normalize_cpp_text(line)
+        for line in symbol.full_signature.splitlines()
+        if _normalize_cpp_text(line)
+    }
+    full_signature_norm = _normalize_cpp_text(symbol.full_signature)
 
     for line in content_lines:
         stripped = line.strip()
@@ -199,6 +206,8 @@ def _normalize_comment(
             tag_name = normalized[1:].split(None, 1)[0]
             if tag_name in managed_tags:
                 continue
+        if _looks_like_declaration_echo(stripped, symbol, signature_line_norms, full_signature_norm):
+            continue
         filtered_content.append(line)
 
     for extra in _tag_lines(options):
@@ -249,6 +258,51 @@ def _comment_content_lines(comment: str) -> list[str]:
         if stripped:
             normalized_lines.append(stripped)
     return normalized_lines
+
+
+def _normalize_cpp_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).strip()
+
+
+def _looks_like_declaration_echo(
+    line: str,
+    symbol: HeaderSymbolInfo,
+    signature_line_norms: set[str],
+    full_signature_norm: str,
+) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    lowered = stripped.lower().rstrip(":")
+    if lowered in {"declaration", "signature", "prototype", "function", "variable"}:
+        return True
+    if lowered.startswith("declaration:") or lowered.startswith("signature:"):
+        return True
+
+    normalized = _normalize_cpp_text(stripped)
+    if not normalized:
+        return False
+    if normalized in signature_line_norms or normalized == full_signature_norm:
+        return True
+
+    if symbol.name not in stripped:
+        return False
+
+    if symbol.kind == "function":
+        return bool(
+            "(" in stripped
+            and ")" in stripped
+            and (
+                stripped.endswith(";")
+                or stripped.endswith("{")
+                or stripped.endswith(")")
+                or stripped.endswith(") const")
+                or stripped.endswith(") noexcept")
+            )
+        )
+
+    return bool(stripped.endswith(";") or "=" in stripped or "{" in stripped)
 
 
 def _tag_lines(options: HeaderCommentOptions) -> list[str]:
